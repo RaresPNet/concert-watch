@@ -170,7 +170,13 @@ export class TicketmasterAdapter implements SourceAdapter {
 	constructor(options: TicketmasterAdapterOptions) {
 		this.apiKey = options.apiKey;
 		this.db = options.db;
-		this.fetchImpl = options.fetchImpl ?? fetch;
+		// `fetch` is a native Workers global whose implementation requires
+		// `globalThis` as its receiver; assigning the bare reference and later
+		// calling it as `this.fetchImpl(...)` invokes it with the adapter
+		// instance as `this` instead, which throws "Illegal invocation" at
+		// runtime (not caught by any local test harness, since Node's fetch
+		// doesn't enforce this). Bind it explicitly.
+		this.fetchImpl = options.fetchImpl ?? fetch.bind(globalThis);
 		this.sleepImpl = options.sleepImpl ?? defaultSleep;
 		this.now = options.now ?? Date.now;
 	}

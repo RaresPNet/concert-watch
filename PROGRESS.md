@@ -918,24 +918,60 @@ developer.ticketmaster.com/products-and-docs/apis/discovery-api/v2/
   future images-pipeline step wants those specifically, `SourceAdapter`/
   `RawSourceEvent` would need a small shape change outside this step's
   touch list — flagging rather than guessing at an extension.
-- No live verification — blocked on missing `TICKETMASTER_API_KEY` (see
-  below). Whoever wires this into a real deploy should do one live fetch
-  against a real attraction before trusting it in production.
 - Doesn't consume the `Rate-Limit-*` response headers to adapt pacing
   dynamically — the fixed 200ms/request throttle is simple and sufficient
   per the task's own guidance.
 
-**Missing credentials — action needed.** No `TICKETMASTER_API_KEY` env var
-or `.dev.vars` entry exists in this repo/environment. The adapter expects
-the key to be passed in as a plain constructor argument
-(`new TicketmasterAdapter({ apiKey: env.TICKETMASTER_API_KEY, ... })`)
-rather than reading `Env` itself, so **no `wrangler.jsonc` change was made
-or needed** — unlike S1.3's `send_email` binding (a resource binding,
-declared in config), an API key is a secret, set via
-`wrangler secret put TICKETMASTER_API_KEY` and never declared in
-`wrangler.jsonc`/`vars`. **To unblock live testing: Rareș needs to obtain a
-free key from developer.ticketmaster.com and run
-`wrangler secret put TICKETMASTER_API_KEY`.**
+**Credentials.** `TICKETMASTER_API_KEY` is already set as a Cloudflare
+Workers secret (confirmed via `wrangler secret list`) — not visible to this
+environment as plaintext, so live verification was done via a temporary
+`/__test-ticketmaster` fetch route added to `src/index.ts`, deployed by
+Rareș, curled, then reverted — same pattern S1.3 used for the mailer. Net
+diff on `src/index.ts` from this step: **none** (confirmed via `git status`
+after revert + redeploy).
+
+**A real bug found and fixed by live testing, not caught by the fixture
+harness.** The first live call returned `{"ok":false,"error":"Illegal
+invocation: function called with incorrect \`this\` reference."}` for every
+request. Cause: the constructor did `this.fetchImpl = options.fetchImpl ??
+fetch;` — assigning the bare `fetch` reference and later calling it as
+`this.fetchImpl(...)` invokes it with the adapter instance as `this`.
+Workers' native `fetch` implementation enforces `globalThis` as its
+receiver and throws on any other `this`; Node's `fetch` (used by the
+fixture harness) does not enforce this, so 34/34 fixture checks passed while
+the real runtime failed on every call. Fixed with
+`fetch.bind(globalThis)`. This is exactly the class of bug S1.3's "verify
+against a real deploy, not just fixtures" precedent exists to catch —
+flagging it as a reminder that Worker-runtime-specific behavior (`fetch`,
+`crypto.subtle`, etc.) needs a real deploy to fully trust, not just a
+Node-based harness.
+
+**Live verification, after the fix (real calls against
+app.ticketmaster.com, via the deployed Worker):**
+```
+Attraction lookup, "IDLES": found id K8vZ917KNX7, upcomingEvents._total: 0
+  -> adapter correctly returns 0 events (a true "no shows right now",
+     not a bug — confirmed by inspecting the raw attraction response).
+
+Attraction lookup, "Coldplay": 10 candidates returned for the keyword,
+  mostly tribute acts ("Ultimate Coldplay", "Talk tribute Coldplay", etc.)
+  plus the real "Coldplay" (id K8vZ9171izV, upcomingEvents._total: 0). The
+  adapter's exact-case-insensitive-match logic correctly picks the real
+  "Coldplay" over the tribute acts ranked above it by Ticketmaster's own
+  keyword relevance -- it just has 0 current TM listings, same as IDLES.
+
+Attraction lookup + full fetchEvents, "Metallica": id K8vZ9171G9V,
+  upcomingEvents._total: 63. adapter.fetchEvents() returned all 63 events,
+  correctly mapped: e.g. one event at Sphere, Las Vegas, starts_at
+  "2026-10-02T03:30:00Z", timezone "America/Los_Angeles", country "US",
+  onsale_at "2026-03-06T18:00:00Z", presale_at "2026-03-02T15:00:00Z"
+  (correctly the EARLIEST of multiple presales), a real ticket_url, and a
+  16:9 image_url -- confirming pagination, on-sale/presale extraction, and
+  image selection all work end-to-end against the real API.
+```
+The temporary route and its raw-response debug variant lived only in
+`src/index.ts` for the duration of testing and were fully reverted
+afterward (`git status` shows zero diff on that file).
 
 **Verification performed.**
 ```
@@ -943,7 +979,9 @@ npx tsc --noEmit -p tsconfig.json                  # clean, no errors
 npx prettier --check src/sources/ticketmaster.ts   # clean
 
 # Standalone harness (hand-written fixtures matching the real Discovery API v2
-# shape confirmed above — no live key available), 34/34 passed:
+# shape), 34/34 passed -- see full list below. Missed the fetch-binding bug
+# above, since Node's fetch doesn't enforce a `this` receiver; only the real
+# deploy caught it.
 npx tsx test-ticketmaster.mts
   PASS attraction lookup sends apikey / keyword / classificationName=Music
   PASS event fetch sends attractionId
@@ -963,9 +1001,14 @@ npx tsx test-ticketmaster.mts
   PASS no attraction match -> empty array, recorded as success not failure
   PASS HTTP error propagates and recordSourceFailure called with status in message
   PASS throttle invoked before subsequent requests, delay within 5 req/s budget
+
+# Live, post-fix, against the real deployed Worker + real Ticketmaster API:
+curl https://concert-watch.raresp98.workers.dev/__test-ticketmaster?name=Metallica
+  -> {"ok":true,"count":63,"sample":[...]}   # see live verification above
 ```
 The harness lived only in the session scratchpad (not committed) — this
-step's touch list is `src/sources/ticketmaster.ts` only.
+step's touch list is `src/sources/ticketmaster.ts` only; `src/index.ts` was
+temporarily modified for live testing and fully reverted.
 
 **Proposed commit message.**
 ```
@@ -978,10 +1021,15 @@ fixed 200ms (5 req/s) throttle per DESIGN.md §6.2. Records
 source_health via recordSourceSuccess/Failure on every call. API
 shape verified against developer.ticketmaster.com's current Discovery
 API v2 docs, not assumed from training data. No wrangler.jsonc change
-needed — the API key is a plain constructor argument, meant to be
-sourced from a TICKETMASTER_API_KEY secret rather than a vars entry.
-Verified against hand-written fixtures (34/34 checks); no live key
-available in this environment to test against the real API.
+needed — the API key is a plain constructor argument, sourced from
+the existing TICKETMASTER_API_KEY Workers secret.
+
+Verified live against a real deploy: fixed a real "Illegal invocation"
+bug (fetch called with the wrong `this` receiver — a Workers-runtime
+quirk Node's fetch doesn't enforce, so it passed all 34 fixture checks
+but failed every real call) via fetch.bind(globalThis), then confirmed
+against real Ticketmaster data — 63 real Metallica events fetched and
+correctly mapped (dates, venue, earliest presale, ticket URL, image).
 ```
 
 ---
