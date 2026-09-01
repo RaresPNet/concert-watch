@@ -81,11 +81,22 @@ One Cloudflare Worker, as with kindle-digest.
 - **Cron** fires once daily at 08:00 EET. The poll path is deterministic and
   involves no model at all (§6).
 - **Email in** via Cloudflare Email Routing → Email Worker. Receiving is free.
-- **Email out** via **Cloudflare Email Service** (public beta since April 2026,
-  native Workers binding, no API keys, no HTTP boilerplate). Chosen for the
-  integration simplicity. Accepted risk: it is beta and the API may change
-  before GA. Keep sending behind a thin `mailer` interface so swapping to
-  Resend is a one-file change if the beta bites.
+- **Email out** via **Cloudflare Email Service**, sending **only to verified
+  destination addresses**. Sending to arbitrary recipients requires the $5/mo
+  Workers Paid plan; sending to addresses verified in the account is free on
+  all plans and doesn't count toward the monthly quota or daily limits. Since
+  the system only ever mails two people, this is a hard constraint we happen to
+  satisfy for free.
+
+  **Implication for the data model:** a subscriber is not usable until their
+  address is a verified Email Routing destination. Add `verified_at` to
+  `subscribers` and refuse to send otherwise. Onboarding a third person means
+  they click a Cloudflare confirmation link first — fine at this scale, but it
+  is a real step, not a formality.
+
+  Keep sending behind a thin `mailer` interface. If the verified-destination
+  route ever stops being workable, Resend's free tier (3,000/month) is a
+  one-file swap.
 - **Claude, split by who triggers it.** This split is deliberate and is the
   core cost-safety decision of the project:
   - **Scheduled, autonomous work** — the daily digest and the `dark`-artist
@@ -97,6 +108,30 @@ One Cloudflare Worker, as with kindle-digest.
     email, so it cannot accrue cost unobserved.
   - Consequence and its mitigation: the digest now depends on a scheduled task
     firing. See §10.4, the fallback digest.
+
+---
+
+### 3.1 Free-plan constraints
+
+Staying on the Workers Free plan is viable but imposes two things that shape
+the code, not just the budget:
+
+1. **10 ms CPU per invocation.** Workers handling incoming email count toward
+   standard CPU and memory limits, and complex handlers on the free plan can
+   exceed them and fail to process a message, showing up in logs as
+   `EXCEEDED_CPU`. Two places are at risk: MIME parsing of inbound mail, and
+   rendering the digest HTML. Keep both lean — string templating, not a
+   framework; no image processing in the request path. Note that CPU time is
+   not wall-clock time, so waiting on the Anthropic API or on D1 costs nothing
+   here.
+2. **Send success is not visible in Email Routing.** Emails sent from a Worker
+   via the `send_email` binding appear in the Email Routing summary as
+   *dropped* even when they were delivered. Since `sent_at` gates the whole
+   notification state machine (§9.3), delivery must be confirmed from the
+   email sending metrics and logs, never from the routing summary.
+
+If `EXCEEDED_CPU` turns up in practice, that is the honest trigger to pay the
+$5 — not a preemptive reason to.
 
 ---
 
@@ -222,27 +257,44 @@ reported back in the confirmation email rather than silently dropped.
 - **Band mailing lists** — rejected. Cheapest possible channel, unpleasant to
   live with.
 
-### 6.2 Sources, in cost order
+### 6.2 Sources, in priority order
 
-1. **Ticketmaster Discovery API.** Free key, 5000 calls/day, 5 req/s. Strong
-   coverage of the UK, Germany, Netherlands, Nordics, Spain, Ireland — where
-   most of these shows will be. Does not operate in Romania or Hungary.
-2. **Bandsintown.** Best coverage for self-reported dates anywhere. Official
-   keys are artist-scoped unless Bandsintown authorises broader access through
-   their partnership programme, so we use the **free legacy public `app_id`
-   endpoint**. It works today; it is unofficial and can disappear without
-   notice.
+**Note on Bandsintown.** Their support documentation states the API is for
+artists and people working on their behalf, and that the data is not meant to
+be used in other circumstances without their approval. There is no self-serve
+signup for a case like ours. An access request has been sent to
+`biz@bandsintown.com`; until it is answered, **Bandsintown is not a source**.
+The adapter (S2.2) is still written, but ships disabled behind a config flag
+so it can be switched on the day a key arrives. Do not work around this with
+an arbitrary `app_id`.
 
-   Because of that, every source sits behind a common adapter interface and a
-   source that starts failing **degrades rather than breaks the run**. Record
-   consecutive failures per source; after three, include a one-line warning at
-   the bottom of the next digest. Losing Bandsintown silently would be the
-   worst possible failure mode, since it covers the bands Ticketmaster
-   doesn't.
+1. **Ticketmaster Discovery API.** The backbone. Free key, 5000 calls/day,
+   5 req/s. Strong coverage of the UK, Germany, Netherlands, Nordics, Spain
+   and Ireland — where most tier A/B shows will be. Does not operate in
+   Romania or Hungary.
+2. **Band tour pages, via JSON-LD.** Promoted to a primary source. This is the
+   artist's own published data, in a format explicitly meant to be machine-read,
+   on their own site — the most legitimate source in the design and previously
+   underweighted. Fetch, hash, compare; parse `MusicEvent` blocks on change.
+   Expect roughly half of a 25-band list to publish usable structured data.
 3. **Songkick.** Documented keyed API; keys have been hard to obtain for
    years. Apply, don't plan around it.
-4. **Band tour pages.** Fetch, hash, compare. One HTTP request per artist per
-   day. Only a *changed* hash triggers any parsing.
+4. **Claude search sweep** over `coverage = 'dark'` artists. Now carrying more
+   weight than originally planned — it covers Romania, Hungary, and every band
+   whose site publishes nothing structured.
+5. **Bandsintown.** Only if access is granted.
+
+**Consequence.** More artists land in `dark` coverage than the original design
+assumed, so the sweep does more work. At 25 bands this is still the cheapest
+line in §12.2 with room to spare. If the list grows past roughly 50, revisit
+the rotation decision in §6.3 before anything else.
+
+**Degradation.** Every source sits behind a common adapter interface, and a
+source that starts failing degrades rather than breaking the run. Record
+consecutive failures per source in `source_health`; after three, add a
+one-line warning at the bottom of the next digest. Losing Ticketmaster
+silently is now the worst failure mode, since it carries the majority of
+reachable shows.
 
 ### 6.3 Poll cadence
 
@@ -688,10 +740,13 @@ tuning.
 
 ## 14. Decisions taken
 
-1. **Bandsintown** — free legacy endpoint, with per-source failure tracking and
-   a warning line in the digest after three consecutive failures (§6.2).
-2. **Email** — Cloudflare Email Service, behind a swappable `mailer`
-   interface (§3).
+1. **Bandsintown** — not a source until access is granted. Their terms
+   restrict the API to artists and their representatives; there is no
+   self-serve route for this use case, and no workaround will be used. Request
+   sent to `biz@bandsintown.com`; adapter ships disabled behind a flag (§6.2).
+2. **Email** — Cloudflare Email Service, sending only to verified destination
+   addresses so it stays free on the Workers Free plan, behind a swappable
+   `mailer` interface (§3, §3.1).
 3. **Budapest** — included, ranked second among origins (§7.1).
 4. **Clustering** — no window. Send as soon as qualifying dates appear; flag
    "more expected" only on positive evidence; follow up when later dates land
