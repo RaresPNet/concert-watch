@@ -591,3 +591,109 @@ send_email binding to wrangler.jsonc (required exception to the
 step's touch list) and confirms a real send against the deployed
 Worker, returning messageId "<r1V81hvO7zWbbmbkXGyg6hQyhoeIsNaWPo0C@raresp.net>".
 ```
+
+---
+
+## S2.0 — Adapter interface and normaliser
+
+**Built.**
+- `src/sources/types.ts` — `SourceName` (`'ticketmaster' | 'bandsintown' |
+  'tourpage'`; MusicBrainz/S2.4 is a name lookup, not an event source, so it
+  doesn't implement this), `SourceArtistRef` (what an adapter needs to fetch
+  one artist's events), `RawSourceEvent` (an adapter's pre-normalisation
+  output — `country` documented as required-ISO2, adapter's job to map to
+  it), `SourceAdapter` interface (`{ source, fetchEvents(artist) }`), and
+  `NormalisedEvent` (the normaliser's output, shaped to feed
+  `upsertEventByFingerprint` from `src/db/queries.ts` directly; `tour_id` is
+  deliberately absent — S3.3 assigns it).
+- `src/sources/normalise.ts` — pure functions, no DB access:
+  - `normaliseCityKey(city, countryCode)` — `iso2:snake_case_ascii` (e.g.
+    `"gb:leeds"`, `"ro:targu_mures"`), matching the convention
+    `scripts/seed-reach.ts` (S1.2) already established for
+    `reachability`/`origins`, so S3.4's join has both sides agreeing.
+    Diacritics stripped via Unicode NFD + combining-mark removal.
+  - `computeFingerprint(mbid, startsAt, cityKey)` —
+    `sha1(mbid | date | normalised_city)` per DESIGN.md §4, using
+    `crypto.subtle.digest('SHA-1', ...)` (Web Crypto — no `nodejs_compat`
+    flag is set in `wrangler.jsonc`, so this had to avoid `node:crypto`).
+    `date` is the `YYYY-MM-DD` prefix of `starts_at`, not the full
+    timestamp, so two sources reporting the same date at slightly different
+    times of day still collapse to one fingerprint.
+  - `computeContentHash(...)` — material fields only (date, venue, status,
+    on-sale), also sha1 over Web Crypto.
+  - `normaliseEvent(raw, artist)` — the actual normaliser. Returns
+    `{ ok: true, event: NormalisedEvent } | { ok: false, reason:
+    'missing_mbid', raw }`. An artist with no `mbid` (i.e. `dark` coverage)
+    quarantines the raw event by handing it back rather than throwing or
+    silently dropping it, per DESIGN.md §4's "quarantined, not dropped."
+
+**Assumed.**
+- The MBID in the fingerprint formula is the **artist's** MBID
+  (`artists.mbid`), not a per-event field — `RawSourceEvent` has no `mbid`
+  of its own; `normaliseEvent` takes `{ id, mbid }` for the artist
+  separately (the shape callers already have from `ArtistRow`/`getArtistById`).
+  This is the only reading of §4's formula that makes sense: individual
+  Ticketmaster/tour-page events don't carry MBIDs, artists do.
+- `country` on `RawSourceEvent` must already be an ISO 3166-1 alpha-2 code
+  (validated by `normaliseCityKey`, which throws on anything else) — pushed
+  onto each adapter (S2.1–S2.3) rather than guessed at generically here,
+  since only they know their upstream API's country representation.
+- `city_key` scheme reuses S1.2's exact convention rather than inventing a
+  second one, since §7's reachability join (S3.4) needs `events.city_key`
+  and `reachability.city_key` to be produced the same way. Not stated
+  explicitly in DESIGN.md beyond the one example, but the alternative
+  (inventing a second, incompatible city-key scheme) would silently break
+  S3.4.
+- All hashing uses Web Crypto (`crypto.subtle`), async, rather than
+  `node:crypto` — `wrangler.jsonc` has no `nodejs_compat` compatibility
+  flag, so `node:crypto` is not guaranteed available in the deployed
+  Worker even though `@types/node` is in `tsconfig.json`'s `types` (that's
+  for tooling/scripts like `seed-reach.ts`, not runtime code). This makes
+  `computeFingerprint`/`computeContentHash`/`normaliseEvent` all `async`,
+  which is a mild API cost but the only cross-runtime-correct choice.
+
+**Left undone.**
+- No fixture file committed to the repo (not in this step's touch list:
+  `src/sources/types.ts`, `src/sources/normalise.ts` only). Verified via a
+  standalone harness (12/12 checks; see below), matching S1.4's approach —
+  script lived only in the session scratchpad/temporarily at the repo root
+  for the run, not committed.
+- No adapters exist yet to actually produce a `RawSourceEvent` from a real
+  API — that's S2.1/S2.2/S2.3, which must land after this step per the
+  plan ("must land before S2.1–S2.4").
+
+**Verification performed.**
+```
+npx tsc --noEmit -p tsconfig.json                                  # clean
+npx prettier --check src/sources/types.ts src/sources/normalise.ts # clean (after --write)
+
+# Standalone harness (two hand-written fixture payloads — Ticketmaster and
+# a tour page — describing the same IDLES/Leeds show), 12/12 passed,
+# including the step's own done-when:
+node --experimental-strip-types test-normalise.mts
+  PASS both sources normalise ok
+  PASS same fingerprint despite different source/time/onsale
+  PASS fingerprint is a 40-char hex sha1
+  PASS city_key normalised
+  PASS content_hash differs when onsale_at differs
+  PASS different city -> different fingerprint
+  PASS city_key strips Romanian diacritics
+  PASS city_key is stable with/without diacritics
+  PASS missing mbid -> quarantined, not thrown/dropped
+  PASS quarantined result carries the raw event back
+  PASS computeFingerprint deterministic
+  PASS content_hash changes when date changes
+```
+
+**Proposed commit message.**
+```
+Add source adapter interface and event normaliser (S2.0)
+
+SourceAdapter/RawSourceEvent/NormalisedEvent in src/sources/types.ts
+and the normaliser in src/sources/normalise.ts: deterministic
+city_key (matching S1.2's iso2:snake_case scheme), sha1 fingerprint
+and content_hash via Web Crypto, and quarantine-not-drop handling
+for events from artists with no MBID. Verified against two fixture
+payloads (Ticketmaster + tour page) for the same show collapsing to
+one fingerprint.
+```
