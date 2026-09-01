@@ -16,6 +16,7 @@
  */
 
 import { emailHandler } from './mail/inbound';
+import { resolveArtist } from './core/resolve';
 
 export default {
 	// S1.4: inbound mail capture. Logic lives in src/mail/inbound.ts; this is
@@ -23,8 +24,25 @@ export default {
 	// default export.
 	email: emailHandler,
 
-	async fetch(req) {
+	async fetch(req, env) {
 		const url = new URL(req.url);
+
+		if (url.pathname === '/__test-resolve') {
+			const name = url.searchParams.get('name') ?? 'IDLES';
+			try {
+				const result = await resolveArtist(name, {
+					anthropicApiKey: (env as any).ANTHROPIC_API_KEY,
+					ticketmasterApiKey: (env as any).TICKETMASTER_API_KEY,
+				});
+				return new Response(JSON.stringify({ ok: true, name, result }), { headers: { 'content-type': 'application/json' } });
+			} catch (err) {
+				return new Response(JSON.stringify({ ok: false, error: err instanceof Error ? err.message : String(err) }), {
+					status: 500,
+					headers: { 'content-type': 'application/json' },
+				});
+			}
+		}
+
 		url.pathname = '/__scheduled';
 		url.searchParams.append('cron', '* * * * *');
 		return new Response(`To test the scheduled handler, ensure you have used the "--test-scheduled" then try running "curl ${url.href}".`);

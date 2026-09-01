@@ -30,6 +30,18 @@ export const MUSICBRAINZ_USER_AGENT = 'concert-watch/0.1 (raresp98@gmail.com)';
 const MIN_REQUEST_INTERVAL_MS = 1000;
 
 /**
+ * MusicBrainz's search index occasionally returns a transient 503 ("server
+ * is currently busy") under normal load -- observed live during S2.4's own
+ * verification and again during S3.1's live resolve.ts testing (a genuine,
+ * not hypothetical, failure). These statuses are worth one retry with
+ * backoff; anything else (4xx other than 429, a genuine query problem) is
+ * not retried.
+ */
+const RETRYABLE_STATUSES = new Set([429, 502, 503, 504]);
+const MAX_ATTEMPTS = 3;
+const RETRY_BACKOFF_MS = 1000;
+
+/**
  * One candidate artist returned by a MusicBrainz name search, trimmed to
  * the fields S3.1's disambiguation step needs to show/reason over.
  * `mbid` is MusicBrainz's `id` field, renamed here to match this
@@ -150,24 +162,36 @@ export async function lookupArtistCandidates(name: string, options: MusicBrainzL
 	const limit = options.limit ?? 10;
 	const minIntervalMs = options.minRequestIntervalMs ?? MIN_REQUEST_INTERVAL_MS;
 
-	await throttle(minIntervalMs);
-
 	const url = new URL(MUSICBRAINZ_ARTIST_SEARCH_URL);
 	url.searchParams.set('query', `artist:${escapeLuceneQuery(trimmed)}`);
 	url.searchParams.set('fmt', 'json');
 	url.searchParams.set('limit', String(limit));
 
-	const response = await fetch(url.toString(), {
-		headers: {
-			'User-Agent': MUSICBRAINZ_USER_AGENT,
-			Accept: 'application/json',
-		},
-	});
+	let lastError: Error | undefined;
+	for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+		await throttle(minIntervalMs);
 
-	if (!response.ok) {
-		throw new Error(`MusicBrainz artist search failed: ${response.status} ${response.statusText} for query "${trimmed}"`);
+		const response = await fetch(url.toString(), {
+			headers: {
+				'User-Agent': MUSICBRAINZ_USER_AGENT,
+				Accept: 'application/json',
+			},
+		});
+
+		if (response.ok) {
+			const body = (await response.json()) as MusicBrainzApiResponse;
+			return (body.artists ?? []).map(toCandidate);
+		}
+
+		lastError = new Error(`MusicBrainz artist search failed: ${response.status} ${response.statusText} for query "${trimmed}"`);
+		if (!RETRYABLE_STATUSES.has(response.status) || attempt === MAX_ATTEMPTS) {
+			throw lastError;
+		}
+		// Exponential backoff on top of the standard throttle -- 1s, then 2s.
+		await new Promise((resolve) => setTimeout(resolve, RETRY_BACKOFF_MS * attempt));
 	}
 
-	const body = (await response.json()) as MusicBrainzApiResponse;
-	return (body.artists ?? []).map(toCandidate);
+	// Unreachable (the loop always returns or throws), but keeps TypeScript
+	// happy about every code path returning.
+	throw lastError ?? new Error(`MusicBrainz artist search failed for query "${trimmed}"`);
 }

@@ -1190,3 +1190,440 @@ string location.address (not the spec'd PostalAddress object) and a
 non-ISO "UK" country code that needed name-table lookup to beat a
 naive 2-letter passthrough.
 ```
+
+---
+
+## Phase 3 — Core logic (S3.1–S3.4)
+
+Implemented as one continuous pass (same session, not four independent fresh
+agents), in the sequence the plan requires: S3.1 → S3.2 → S3.3 → S3.4. One
+shared cross-cutting bug and its fix are documented once, under S3.2, where
+it was found — S3.3/S3.4's entries reference it rather than repeating it.
+
+### S3.1 — Artist resolution pass
+
+**Built.**
+- `src/core/resolve.ts` — `resolveArtist(name, opts)`. Gathers candidates from
+  MusicBrainz (`lookupArtistCandidates`, S2.4) and a Ticketmaster attraction
+  search (a small duplicate of the lookup `TicketmasterAdapter` already does
+  internally — that method is private to `fetchEvents`, and this step's touch
+  list is this file only), then asks Claude (Haiku 4.5, per §11.5) to pick the
+  right MusicBrainz identity via a forced tool-use call (`resolve_artist`),
+  never free-text parsing. Returns exactly the contract DESIGN.md §5
+  specifies: `{ resolved: ResolvedArtist } | { ambiguous: true; candidates;
+  question }`.
+  - `coverage` is `'api'` when the model's chosen artist also matched a
+    Ticketmaster attraction, `'dark'` otherwise — matching §5's "api if any
+    structured source returned the artist" (MusicBrainz itself is a naming
+    lookup, not one of §6.2's structured event sources).
+  - A model response naming an `mbid` that wasn't among the candidates
+    offered is treated as a hallucination and throws, rather than being
+    trusted.
+  - No MusicBrainz candidates at all → resolves immediately to `coverage:
+    'dark'` with an explanatory note, without ever calling the model (nothing
+    for it to disambiguate).
+  - This file never touches D1 — persisting the resolved artist to `artists`
+    is left to whichever caller adds a new band (not yet built: S5.2's invite
+    flow, or a future add-artist path in S4.6's inbound handler).
+
+**Bandsintown gap (documented, not a regression).** DESIGN.md §5 describes
+gathering candidates from MusicBrainz, Ticketmaster, *and* Bandsintown. S2.2
+was explicitly skipped (see its own PROGRESS.md entry) and Bandsintown ships
+disabled regardless per §6.2, so there is no adapter to gather from — this
+pass relies on MusicBrainz + Ticketmaster only. Nothing Bandsintown would
+have contributed today exists to lose.
+
+**Live verification (real calls, via a temporary `/__test-resolve` route in
+`src/index.ts`, deployed by Rareș).** Per Rareș's explicit request, this route
+is being **kept in place** rather than reverted after testing (a deliberate
+deviation from every earlier step's "add a temp route, verify, revert"
+pattern) — it's expected to be reused/adapted for later verification passes
+rather than re-added from scratch each time. Diff on `src/index.ts` from this
+step: the `/__test-resolve` route (`import resolveArtist`; `env` cast to `any`
+for the two secrets, since they're not in the generated `Env` type — same
+pattern S1.3/S2.1 used).
+
+```
+GET /__test-resolve?name=IDLES
+  -> resolved, mbid be465d4f-c28d-4ba1-94ab-ebaada7db8af (the correct band),
+     tm_attraction_id K8vZ917KNX7, coverage "api", a genuine explanatory note.
+
+GET /__test-resolve?name=Low
+  -> resolved, mbid 42faad37-8aaa-42e4-a300-5a7dae79ed24 (the correct
+     Minnesota slowcore band), coverage "dark" (no Ticketmaster match --
+     honest, Low has no current TM listing under that adapter's matching
+     logic), correct note.
+
+GET /__test-resolve?name=Chrome
+  -> resolved (not ambiguous) to the correct 1976 US post-punk band, mbid
+     3b35df0a-6181-42e3-9e81-b93f681d636f, tm_attraction_id K8vZ91734i7. This
+     is a legitimate model judgment call, not a bug: MusicBrainz's own scores
+     put this candidate at 100 vs. much lower scores for the other "Chrome"
+     entries (S2.4's PROGRESS.md entry shows the same gap live), so a
+     confident resolution here is defensible -- the ambiguous path itself
+     (two-plus similarly-scored candidates) was exercised by S2.4's own
+     MusicBrainz-level verification, not re-proven end-to-end through the
+     model here.
+```
+
+**A real, non-hypothetical bug found live, fixed.** The first `Low` query
+returned a 503 from MusicBrainz's search index ("server is currently busy" --
+the same transient failure mode S2.4's own PROGRESS.md entry had already
+flagged as unhandled and left undone). Per Rareș's explicit request after
+seeing this, added retry-with-backoff to `src/sources/musicbrainz.ts`'s
+`lookupArtistCandidates` (touched outside S3.1's nominal scope, but directly
+requested): up to 3 attempts, retrying only on 429/502/503/504, each retry
+still passing through the existing 1 req/s throttle plus an additional
+1s/2s exponential backoff; a non-retryable status (a genuine query problem)
+still throws immediately, unchanged from before.
+
+**Assumed.**
+- `official_url`/`tour_url` in a resolved result are best-effort, whatever
+  the model states with confidence from its own knowledge — there is no web
+  search tool available to this pass (that's S4.5/Sonnet-tier work, not
+  built), so these are honestly unverified and frequently `null` (seen live:
+  `Low` and `Chrome` both came back with `tour_url: null`). Documented in the
+  tool schema description handed to the model ("if you know it with
+  confidence... otherwise null") rather than silently trusting whatever comes
+  back.
+- `bit_slug`/`songkick_id` are always `null` — no Bandsintown adapter, no
+  Songkick key (§6.2: "apply, don't plan around it").
+- Model routing follows §11.5 literally: Haiku 4.5 for this "common case"
+  tier, not Sonnet.
+
+**Left undone.**
+- No caller persists a resolved/ambiguous result anywhere yet -- by design,
+  outside this step's touch list.
+- The `ambiguous` path (a genuinely close MusicBrainz score gap forcing the
+  model to ask a did-you-mean question) was not exercised end-to-end live in
+  this step's own testing -- `Chrome` resolved confidently instead, for the
+  legitimate reason given above. `askModelToResolve`'s prompt and tool schema
+  are written to support it, but nobody has watched it fire for real yet.
+
+**Verification performed.**
+```
+npx tsc --noEmit -p tsconfig.json                 # clean
+npx prettier --check src/core/resolve.ts src/sources/musicbrainz.ts src/index.ts  # clean (after --write)
+
+# Live, via the deployed Worker's /__test-resolve route (Rareș ran
+# `npx wrangler deploy` and the curls; see the three real responses above).
+```
+
+**Proposed commit message.**
+```
+Add model-assisted artist resolution pass (S3.1)
+
+resolveArtist() gathers MusicBrainz + Ticketmaster candidates and
+asks Claude (Haiku 4.5, forced tool-use) to pick the right identity
+or flag ambiguity with a did-you-mean question -- never guesses, and
+refuses an mbid the model wasn't actually offered. No Bandsintown
+(adapter never built) or Songkick (no key). Verified live via a
+kept-in-place /__test-resolve route: IDLES and Low both resolve
+correctly; found and fixed a real MusicBrainz 503 with retry/backoff
+in src/sources/musicbrainz.ts.
+```
+
+---
+
+### S3.2 — Poll orchestrator
+
+**Built.**
+- `src/core/poll.ts` — `pollAll(deps)`, the LLM-free daily pass (DESIGN.md
+  §6.4). Poll set is `getDistinctWatchedArtistIds` (S1.1) -- the dedup
+  requirement. For each artist: fetches Ticketmaster events (if a
+  `SourceAdapter` is injected) and checks the tour page (`checkTourPage`,
+  S2.3, if `tour_url` is set), normalises every raw event (S2.0), and
+  upserts by fingerprint, classifying each as `inserted` / `changed` /
+  `unchanged` / `quarantined` by comparing the pre-upsert row's
+  `content_hash` against the freshly computed one. Reports a structured
+  `PollRunResult` (per artist: event outcomes, a `needs_model_parse` flag,
+  and per-source errors) rather than just mutating D1 silently -- S3.3 reads
+  this directly instead of re-deriving "what's new" from `events` itself.
+  Always touches `last_polled_at`; touches `last_activity_at` only when
+  something was actually inserted or changed.
+- `src/db/queries.ts` additions (outside this step's nominal touch list, but
+  unavoidable -- core logic needs D1 access and S1.1's own entry anticipated
+  this: "Left for the steps that actually need them"): `touchArtistActivity`,
+  `updateArtistTourPageHash`, `getEventById`,
+  `getFutureActiveEventsWithoutTour`, `setEventTourId`,
+  `getEventsOnsaleBetween` (the last three used by S3.3, added here since
+  they're small and this is where the events-table gap was first felt).
+  **Note on the resulting diff size:** `queries.ts` was apparently never run
+  through Prettier before (it used 2-space indentation; `.prettierrc` in this
+  repo says `useTabs: true`, matching every other `src/` file). Running
+  `prettier --write` after adding the new functions reformatted the entire
+  file to tabs, so the git diff on this file touches far more lines than the
+  actual additions -- flagging this explicitly so it doesn't read as a much
+  bigger change than it is. No behavioural change from the reformat itself.
+
+**A real cross-step bug found by the fixture harness, fixed in
+`queries.ts`.** `upsertEventByFingerprint`'s (S1.1) `ON CONFLICT` clause did
+`tour_id = excluded.tour_id` unconditionally. `NormalisedEvent` (S2.0) never
+carries a `tour_id` (clustering, S3.3, assigns it later) -- so every re-poll
+of an already-clustered event was silently **wiping its `tour_id` back to
+NULL**, because `excluded.tour_id` was always `null` on the conflict path.
+This wouldn't have shown up in S1.1's or S2.0's own isolated testing (neither
+step's fixtures ever ran a second poll against an event that already had a
+`tour_id`); it surfaced immediately once S3.2's poll → S3.3's cluster → poll
+again sequence was actually exercised end-to-end. Fixed with `tour_id =
+COALESCE(excluded.tour_id, events.tour_id)` -- a later poll's upsert now
+preserves whatever `tour_id` clustering already assigned instead of clobbering
+it, while a genuinely-new event's first insert is unaffected (there's nothing
+to preserve yet).
+
+**Assumed.**
+- `needs_model_parse` artists are reported back in `PollRunResult` but not
+  durably queued anywhere -- there's no schema for "tour pages awaiting a
+  model parse" (S4.7's `get_unparsed_pages()` MCP tool is presumably meant to
+  read this from somewhere, but that table/column doesn't exist yet and
+  adding one is a migration, outside every S3.x touch list). `tour_page_hash`
+  is still updated in this case, so the page isn't re-flagged as "changed"
+  every single day even though nothing durably remembers it needs parsing --
+  flagging this gap explicitly for S4.7/S6.4 rather than inventing a schema
+  change here.
+- A source failure (Ticketmaster throwing, or `checkTourPage` returning
+  `fetch_failed`) is caught and recorded in `PollArtistResult.errors`, but
+  does not stop the rest of that artist's poll (the other source still runs)
+  or any other artist's poll -- matches DESIGN.md §6.2's "a source that
+  starts failing degrades rather than breaking the run."
+- Quarantined events (no MBID) are reported in the outcome list with
+  `event_id: null` and are not persisted anywhere -- matches DESIGN.md §4
+  ("quarantined, not dropped") in spirit, but there's genuinely nowhere to
+  put a quarantined raw event in the current schema; a future step handling
+  "dark" artist resolution retroactively would need one.
+
+**Left undone.**
+- No wiring exists yet to construct a real `TicketmasterAdapter` and call
+  `pollAll` from the cron handler -- that's S5.1.
+- No durable `needs_model_parse` queue, per above.
+
+**Verification performed.**
+```
+npx tsc --noEmit -p tsconfig.json   # clean, whole project
+npx prettier --check src/core/poll.ts src/db/queries.ts   # clean (after --write)
+
+# Integration harness (node:sqlite-backed real D1Database shim, running the
+# actual migrations/*.sql against an in-memory SQLite DB, then calling
+# pollAll/clusterTours/runNotificationPass/attachReachabilityToTour
+# unmodified against it) -- combined with S3.3/S3.4's checks below, 25/25
+# passed. Poll-specific:
+PASS poll run1: two events reported (1 TM + 1 tourpage), both inserted
+PASS poll run2: Leeds TM event unchanged, London TM event inserted
+PASS poll run3: Leeds event reported as changed (venue update)
+PASS DONE-WHEN S3.2: inserts new, updates changed, leaves unchanged untouched
+```
+Harness lives only in the session scratchpad, not the repo.
+
+**Proposed commit message.**
+```
+Add daily poll orchestrator (S3.2)
+
+pollAll() fetches Ticketmaster + tour-page events per distinct
+watched artist, normalises and upserts by fingerprint, and classifies
+each as inserted/changed/unchanged/quarantined for S3.3 to consume --
+no model call anywhere in this file. Fixes a real bug in
+upsertEventByFingerprint (S1.1): its ON CONFLICT clause was
+unconditionally resetting tour_id to NULL on every re-poll of an
+already-clustered event; now preserves it via COALESCE unless a real
+value is supplied.
+```
+
+---
+
+### S3.3 — Tour clustering and notification state machine
+
+**Built.**
+- `src/core/tours.ts` — `clusterTours(db, artistIds, todayIso)` /
+  `clusterToursForArtist`. Per DESIGN.md §9.1's "no window" rule: pulls every
+  future, still-`active`, not-yet-clustered event for an artist
+  (`getFutureActiveEventsWithoutTour`); if the artist has an "open" tour
+  (`getOpenTourForArtist` -- most recently created tour whose `last_date`
+  hasn't passed), attaches the new events to it and fires `new_dates`;
+  otherwise creates a new `tours` row and fires `new_tour`. Recomputes
+  `date_count`/`first_date`/`last_date` across the tour's *entire* event list
+  (existing + newly attached) after each pass, not just the delta.
+- `src/core/notify.ts` — `runNotificationPass(input)`, all four §9.2
+  triggers:
+  - `new_tour` / `new_dates`: one row per (subscriber, tour) -- `event_id`
+    NULL, per §9.1 ("fires per tours row"), `notified_hash` is the sorted,
+    comma-joined ids of the qualifying events in that pass (lets a later
+    material_change check know which specific events a tour-level
+    notification covered).
+  - `material_change`: fires only for subscribers who already received a
+    **delivered** (`sent_at` not null) notification covering this event --
+    checked against *both* event-level rows (`event_id` = this event) and
+    tour-level rows (`event_id` NULL, event covered via `notified_hash`'s id
+    list) via the new `getNotificationsForTour` query. Deduplicated per
+    `content_hash` so the same change isn't re-sent every poll.
+  - `onsale_soon`: scans `events.onsale_at` within a 72h window from "now"
+    (`getEventsOnsaleBetween`), deduplicated per `onsale_at` value per
+    subscriber.
+  - Priority filter (§8) applied before every insert, via `bestTierForCity`
+    (best/lowest tier across every origin for the event's `city_key`) and
+    `priorityAllows`.
+- `src/db/queries.ts` addition: `getNotificationsForTour(db, tourId)` --
+  needed once `notifyForMaterialChange`'s first implementation was found (by
+  the harness, not by inspection) to miss tour-level notifications entirely,
+  since `getNotificationsForEvent` only returns rows with `event_id` set and
+  new_tour/new_dates rows never set it. See below.
+
+**A real logic bug found by the fixture harness, fixed.** The first version
+of `notifyForMaterialChange` checked "was this subscriber already notified
+about this event?" via `getNotificationsForEvent(eventId)` alone -- which
+only returns rows where `event_id` equals that event. But `new_tour`/
+`new_dates` notifications are written with `event_id: NULL` (tour-level, per
+§9.1) and instead list covered event ids in `notified_hash`. So a subscriber
+who *had* already been sent (and delivered) the tour announcement covering
+this exact event was never recognised as "already notified," and
+`material_change` never fired for them -- the fixture's P1 subscriber came
+back with 3 notification rows instead of the plan's specified 4. Fixed by
+adding `getNotificationsForTour` (returns every notification for a tour,
+both shapes) and a `tourLevelNotifCoversEvent` helper that checks a
+tour-level row's `notified_hash` id list.
+
+**Priority → tier mapping: exact for P1/P2, approximated for P3/P4 (flagged
+in the file's own header comment, repeated here).** DESIGN.md §8:
+- P1 chase: A/B/C/D (implemented as "always notify," tier-independent).
+- P2 travel: A/B (implemented exactly).
+- P3 regional: spec says *"C where drivable."* `reachability` stores one
+  tier per `(city_key, origin_iata)` with no separate drivable-vs-connection
+  flag -- S1.2's derivation folds both into tier C, and the distinction only
+  survives as free text inside `route_note`. Approximated as "any tier C."
+  Not silently narrowed to something more specific and wrong; flagged as an
+  assumption a future step could tighten by parsing `route_note` or adding a
+  schema column.
+- P4 local: spec says *"Cluj / Bucharest only."* No city-level "is this
+  Cluj-or-Bucharest-specifically" signal exists in `reachability`.
+  Approximated as `events.country === 'RO'` -- broader than "Cluj/Bucharest"
+  (includes e.g. Timișoara), but a defensible reading of "local," and exact
+  city-level filtering wasn't worth inventing a new column for here.
+
+**"Open tour" simplification (documented, not solved).** An artist running
+two genuinely simultaneous, geographically distinct tours (DESIGN.md §10.1's
+own handle mechanism -- `#A3F` -- anticipates this happening) would have its
+second leg incorrectly folded into whichever tour was created most recently,
+rather than clustered as a separate tour. The plan's own "no window" rule
+doesn't specify how to tell two simultaneous tours apart, and building that
+heuristic (by region? by date-gap?) felt like real scope beyond this step;
+flagged for whoever eventually hits it in practice.
+
+**Assumed.**
+- `content_hash` equality is the only signal for "already sent this specific
+  change" (dedup on `material_change`) -- matches S2.0's `content_hash`
+  definition (date/venue/status/onsale) exactly.
+- A calendar-date reschedule cannot be detected as a same-row
+  `material_change` at all, by construction: `fingerprint = sha1(mbid|date|
+  city)` (§4) bakes the date into the event's identity, so a genuine
+  reschedule necessarily produces a new fingerprint (a new `events` row), not
+  a changed `content_hash` on the old one. In practice this should be fine --
+  a real reschedule is expected to show up as the old instance's `status`
+  flipping to `postponed`/`cancelled` (which *does* register as
+  `material_change` via `content_hash`) plus a new event being announced
+  separately (`new_dates`) -- but it's worth stating plainly since it wasn't
+  obvious until the fixture harness's first attempt at simulating "a date
+  moved" by directly mutating `starts_at` didn't register as a change at all
+  (see the harness's own comment on this).
+
+**Left undone.**
+- The "open tour" simultaneous-tours gap above.
+- P3/P4 approximations above -- not verified against a real ambiguous
+  drivable-vs-not or Cluj-vs-elsewhere-RO fixture, since the schema doesn't
+  carry the distinction to test against yet.
+
+**Verification performed.**
+```
+npx tsc --noEmit -p tsconfig.json                              # clean
+npx prettier --check src/core/tours.ts src/core/notify.ts src/db/queries.ts  # clean (after --write)
+
+# Same integration harness as S3.2, continuing the same fixture sequence
+# (tour announced -> extra dates a week later -> Leeds venue changes ->
+# onsale window already inside 72h on first sighting) -- the plan's own
+# done-when, checked explicitly:
+PASS cluster run1: new_tour (Leeds + Bucharest, first sighting)
+PASS cluster run2: new_dates (London attaches to the same open tour)
+PASS cluster run3: no new clustering outcome (nothing left unclustered)
+PASS notify run1: P1 gets new_tour + onsale_soon (2 rows)
+PASS notify run2: P1 gets new_dates (1 row)
+PASS notify run3: P1 gets material_change (1 row)
+PASS DONE-WHEN S3.3: P1 has exactly 4 notification rows, got 4
+PASS DONE-WHEN S3.3: P4 has fewer than P1, got 1
+```
+
+**Proposed commit message.**
+```
+Add tour clustering and notification state machine (S3.3)
+
+clusterTours() groups an artist's unclustered future dates into a
+tours row (new_tour on first sighting, new_dates when a tour is
+already open, per DESIGN.md §9.1's no-window rule). notify.ts fires
+all four §9.2 triggers with the §8 priority/tier filter applied per
+subscriber before any row is written. Fixes a real bug where
+material_change never fired for events already covered by a
+delivered tour-level (new_tour/new_dates) notification, since those
+rows carry event_id NULL -- added getNotificationsForTour to check
+both notification shapes. Verified against the plan's exact fixture
+sequence: 4 notification rows for a P1 subscriber, fewer for P4.
+```
+
+---
+
+### S3.4 — Reachability join
+
+**Built.**
+- `src/core/reach.ts` — `attachReachabilityToTour(db, tourId)`. For every
+  event on a tour, looks up all `reachability` rows for its `city_key`
+  across every origin and picks the single best one via
+  `pickBestReachability`: lowest tier wins (A best), ties broken by the
+  origin's `penalty_minutes` -- directly implementing §7.1's "a direct
+  flight from CLJ always beats a direct flight from BUD; a direct from BUD
+  beats a one-stop from CLJ" (tier comparison already encodes "direct beats
+  one-stop" per S1.2's own tier derivation; penalty_minutes as the
+  origin-precedence tiebreaker is what's added here). Returns every event
+  with its tier/route_note/origin_iata attached, plus `top_three` -- the
+  tour's three most reachable dates, sorted by (tier asc, date asc), per
+  DESIGN.md §10.1's digest content spec.
+- Deliberately duplicates a small tier-comparison helper rather than
+  importing notify.ts's `bestTierForCity` -- that function only needs the
+  *tier* (for the §8 priority filter, run a step earlier per the plan's own
+  sequencing) where this file needs the full row (tier + route_note +
+  origin) to build actual digest display data. Documented in the file header
+  as a deliberate choice, consistent with this codebase's existing
+  precedent (tourpage.ts's own note on duplicating `hashTourPageContent`).
+
+**Assumed.**
+- An event whose `city_key` has no `reachability` rows at all gets
+  `tier: null` (not defaulted to `'D'`) -- kept honest rather than pretending
+  to know a tier that was never computed; such events sort last (after tier D)
+  in `top_three` ranking, and would need their own handling in whatever
+  builds the actual email (S4.1) to avoid printing a blank tier.
+- No caching of `getAllOrigins`/`getReachability` calls across multiple
+  `attachReachabilityToTour` calls in one run -- each call re-fetches. Fine
+  at this scale (a handful of tours, a handful of origins); flagged in case
+  S4.1's digest builder calls this in a loop over many tours and wants to
+  hoist `getAllOrigins` once.
+
+**Left undone.**
+- No caller exists yet (S4.1's digest payload builder).
+
+**Verification performed.**
+```
+npx tsc --noEmit -p tsconfig.json          # clean
+npx prettier --check src/core/reach.ts     # clean (after --write)
+
+# Same integration harness, against the S3.3 fixture's tour (Leeds tier A
+# via CLJ, Bucharest and London with no reachability rows seeded):
+PASS reach: 3 events on the tour
+PASS reach: Leeds event has tier A via CLJ
+PASS reach: top_three sorted with tier A (Leeds) first
+PASS reach: Bucharest/London have no reachability rows -> tier null
+```
+
+**Proposed commit message.**
+```
+Add reachability join for tour digest data (S3.4)
+
+attachReachabilityToTour() picks each event's best reachability
+option (lowest tier, ties broken by origin penalty_minutes per
+DESIGN.md §7.1) and ranks the tour's top three most reachable dates
+for the digest. Verified against the S3.3 fixture tour.
+```
