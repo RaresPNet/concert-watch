@@ -1,0 +1,54 @@
+{
+  "$schema_note": "Origins table per DESIGN.md §7.1, in precedence order. drive_km/drive_minutes are Cluj-Napoca to the airport by road; penalty_minutes equals drive_minutes and is applied when ranking otherwise-equal reachability options (a direct flight from CLJ always beats a direct flight from BUD; a direct from BUD beats a one-stop from CLJ). CLJ itself carries zero penalty.",
+  "researched_at": "2026-09-01",
+  "origins": [
+    {
+      "iata": "CLJ",
+      "name": "Cluj-Napoca International (Avram Iancu)",
+      "drive_km": 0,
+      "drive_minutes": 0,
+      "penalty_minutes": 0,
+      "notes": "Primary origin. Wizz Air focus city; roughly 35 daily departures, ~56 non-stop destinations across ~24 countries."
+    },
+    {
+      "iata": "BUD",
+      "name": "Budapest Ferenc Liszt International",
+      "drive_km": 450,
+      "drive_minutes": 360,
+      "penalty_minutes": 360,
+      "notes": "Route network larger than every Romanian airport combined. Driving to Budapest to fly out is normal practice from Transylvania. Oradea sits roughly halfway along this drive."
+    },
+    {
+      "iata": "OMR",
+      "name": "Oradea International",
+      "drive_km": 150,
+      "drive_minutes": 150,
+      "penalty_minutes": 150,
+      "notes": "Genuinely drivable; also on the way to BUD."
+    },
+    {
+      "iata": "SBZ",
+      "name": "Sibiu International",
+      "drive_km": 175,
+      "drive_minutes": 165,
+      "penalty_minutes": 165,
+      "notes": "Genuinely drivable."
+    },
+    {
+      "iata": "OTP",
+      "name": "Bucharest Henri Coandă (Otopeni)",
+      "drive_km": 450,
+      "drive_minutes": 390,
+      "penalty_minutes": 390,
+      "notes": "Only for routes nothing else serves. Largest Romanian route network by far, but same drive time as BUD for a smaller/less useful network from a Cluj traveller's perspective."
+    },
+    {
+      "iata": "IAS",
+      "name": "Iași International",
+      "drive_km": 400,
+      "drive_minutes": 360,
+      "penalty_minutes": 360,
+      "notes": "As Bucharest: only for routes nothing else serves."
+    }
+  ]
+}

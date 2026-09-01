@@ -15,7 +15,14 @@
  * Learn more at https://developers.cloudflare.com/workers/
  */
 
+import { emailHandler } from './mail/inbound';
+
 export default {
+	// S1.4: inbound mail capture. Logic lives in src/mail/inbound.ts; this is
+	// wiring only, since Workers only reads handlers off the main module's
+	// default export.
+	email: emailHandler,
+
 	async fetch(req) {
 		const url = new URL(req.url);
 		url.pathname = '/__scheduled';

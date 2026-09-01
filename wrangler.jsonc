@@ -26,6 +26,11 @@
 			"binding": "IMAGES",
 			"bucket_name": "concert-watch-images"
 		}
+	],
+	"send_email": [
+		{
+			"name": "EMAIL"
+		}
 	]
 	/**
 	 * Smart Placement

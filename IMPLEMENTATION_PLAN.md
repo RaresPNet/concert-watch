@@ -42,13 +42,20 @@ Nothing can start until these exist. All manual.
 
 - Domain on Cloudflare, Email Routing enabled.
 - Catch-all or specific address routed to the Worker.
-- Cloudflare Email Service enabled on the account; DNS/DKIM records in place.
+- Cloudflare Email Service enabled; DNS/DKIM records in place.
+- **Verify both personal addresses as Email Routing destinations.** Each owner
+  clicks a confirmation link. Sending is free on the Workers Free plan only to
+  verified destinations (§3) — without this step nothing sends.
 - Verify a hello-world send lands in a real inbox and isn't marked spam.
+- Confirm the account stays on the Workers Free plan. Do not upgrade
+  preemptively; §3.1 names the one symptom that would justify it.
 
 ### S0.3 `[R]` Credentials
 
 - Ticketmaster Discovery API key (free, self-serve).
-- Confirm the Bandsintown legacy endpoint responds for a known artist.
+- Send the Bandsintown access request to `biz@bandsintown.com`. Do not block
+  on it; the adapter ships disabled (§6.2).
+- Apply for a Songkick API key. Same — don't block on it.
 - Anthropic API key, with a **billing alert and a hard spend cap set in the
   console**. Belt and braces alongside the in-app ceiling of §12.4.
 - Secrets stored via `wrangler secret`, never committed.
@@ -71,9 +78,10 @@ tiny typed query layer.
 **Touches.** `migrations/`, `src/db/schema.ts`, `src/db/queries.ts`
 
 **Notes.**
-- Add the `preferences` free-text column on `subscribers` (§11.3) and the
-  `message_id` / `in_reply_to` / `references` / `thread_id` columns on `inbox`
-  (§11.2) — both are in the design but easy to miss from §4 alone.
+- Add the `preferences` free-text column and `verified_at` on `subscribers`
+  (§3, §11.3), and the `message_id` / `in_reply_to` / `references` /
+  `thread_id` columns on `inbox` (§11.2) — all in the design but easy to miss
+  from §4 alone.
 - Add a `source_health` table: `source`, `consecutive_failures`,
   `last_ok_at`, `last_error` (§6.2).
 - Add a `usage` table: `day`, `path`, `model`, `input_tokens`,
@@ -123,9 +131,17 @@ Leeds, London, Milan, Barcelona from CLJ, and tier C for Budapest and Vienna.
 - Keep the interface narrow enough that a Resend implementation is a new file,
   not a refactor (§3).
 - Always send a plain-text alternative.
+- **Refuse to send to any address without `subscribers.verified_at`.** On the
+  free plan an unverified recipient fails, so this is a guard, not politeness.
+- **Confirm delivery from the email sending metrics/logs, not the Email
+  Routing summary**, which reports Worker-sent mail as dropped even on success
+  (§3.1). `sent_at` depends on getting this right (§9.3).
+- Set `Auto-Submitted: auto-replied` and `Precedence: bulk` on every outbound
+  message (§12.4).
 
 **Done when.** A test send produces a message in a real inbox with correct
-`Message-ID` returned.
+`Message-ID` returned, and a send to an unverified address is refused locally
+rather than failing upstream.
 
 ### S1.4 `[A]` `∥` Inbound mail capture
 
@@ -184,21 +200,32 @@ describing the same show, the normaliser produces one fingerprint.
 Attraction-ID lookup, event fetch, pagination, on-sale and presale dates,
 attraction images. Respect 5 req/s. Record failures to `source_health`.
 
-### S2.2 `[A]` `∥` Bandsintown adapter
+### S2.2 `[A]` `∥` Bandsintown adapter — disabled
 
 **Touches.** `src/sources/bandsintown.ts`
 
-Free legacy endpoint (§6.2). Assume it may vanish: every failure increments
-`source_health`, and the adapter returns empty rather than throwing.
+Write the adapter against the documented endpoint shape, but ship it **behind
+a config flag, defaulting off** (§6.2). It has no key and must not run.
 
-### S2.3 `[A]` `∥` Tour-page adapter
+**Do not** use an arbitrary `app_id` to make it work. Their terms restrict the
+API to artists and their representatives; an access request is pending. If the
+flag is off, the adapter returns empty and logs nothing.
+
+### S2.3 `[A]` `∥` Tour-page adapter — primary source
 
 **Touches.** `src/sources/tourpage.ts`
+
+Promoted from a supplementary check to one of the two sources the system
+actually relies on (§6.2). Give it proportionate care.
 
 Fetch the artist's tour page, hash the content, compare against
 `artists.tour_page_hash`. On change, extract JSON-LD `MusicEvent` blocks. If
 JSON-LD exists, emit events with no model call at all. If not, mark the artist
 as needing a model parse and stop — do not call a model from this file.
+
+Handle the common shapes: a bare `MusicEvent`, an array of them, a `@graph`
+wrapper, and `EventSeries`. Test against three real band sites rather than a
+synthetic fixture, since real-world JSON-LD is messier than the spec.
 
 ### S2.4 `[A]` `∥` MusicBrainz lookup
 
@@ -307,7 +334,10 @@ S4.1 and S4.2 run in parallel.
 **Touches.** `src/digest/render.ts`, `src/digest/template.html`
 
 **Notes.**
-- Tables and inline CSS only; no flexbox or grid (§10.3).
+- Tables and inline CSS only; no flexbox or grid (§10.4).
+- **Stay inside the 10 ms CPU budget of the Workers Free plan (§3.1).** String
+  templating, no rendering framework, no image processing in the request path.
+  This is the most likely place to trip `EXCEEDED_CPU`.
 - Dark-mode handling explicit.
 - Under ~102 KB total or Gmail clips it.
 - Images from R2, resized. Plain-text alternative required.
