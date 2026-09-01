@@ -697,3 +697,448 @@ for events from artists with no MBID. Verified against two fixture
 payloads (Ticketmaster + tour page) for the same show collapsing to
 one fingerprint.
 ```
+
+---
+
+## S2.2 — Bandsintown adapter — SKIPPED (not started)
+
+**Deliberately not implemented in this pass.** Rareș asked to skip S2.2
+entirely for now. Per DESIGN.md §6.2, Bandsintown is gated on an access
+request sent to `biz@bandsintown.com` that has not been answered; the plan
+itself says the adapter must ship disabled behind a config flag and must
+never use an arbitrary `app_id` to work around the terms restriction. Nothing
+under `src/sources/bandsintown.ts` exists yet — this is a clean skip, not a
+partial or broken implementation. Revisit once Bandsintown access is granted
+(or if explicitly asked to write the disabled-by-default adapter ahead of
+that, per the plan's original instructions).
+
+---
+
+## S2.4 — MusicBrainz lookup
+
+**Built.**
+- `src/sources/musicbrainz.ts` — `lookupArtistCandidates(name, options?)`, a
+  standalone name -> candidate-MBIDs lookup against the real MusicBrainz web
+  service (`GET https://musicbrainz.org/ws/2/artist/?query=...&fmt=json`), for
+  S3.1's (not yet built) model-assisted disambiguation pass to call. Not a
+  `SourceAdapter` — matches `src/sources/types.ts`'s own comment that
+  MusicBrainz is a name-resolution lookup, not an event source, so it defines
+  its own interfaces rather than implementing `SourceAdapter`.
+  - `MusicBrainzArtistCandidate` — `mbid`, `name`, `sortName`,
+    `disambiguation` (nullable), `score`, `type` (nullable), `country`
+    (nullable), `beginDate`/`endDate` (nullable) — enough for S3.1 to show a
+    human-or-model-readable disambiguation list, ranked by MusicBrainz's own
+    `score` (the API already returns results sorted highest-score-first).
+  - Rate limiting: a module-scoped `throttle()` tracks the timestamp of the
+    last request and `await`s before firing the next one so request *starts*
+    are always ≥1000ms apart, per MusicBrainz's documented "no more than one
+    call per second" limit. Overridable via `options.minRequestIntervalMs`
+    for tests.
+  - `User-Agent` header: `concert-watch/0.1 (raresp98@gmail.com)`, exported
+    as `MUSICBRAINZ_USER_AGENT` — the project owner's real contact address,
+    per MusicBrainz's docs, which are explicit that generic/missing
+    User-Agents get throttled harder or blocked.
+  - Lucene-escapes the artist name before embedding it in `query=` (search
+    syntax is Lucene-based; unescaped `+`, `"`, `(`, `:`, etc. in a band name
+    could otherwise be parsed as query operators).
+  - Blank/whitespace-only names short-circuit to `[]` without a network call
+    or consuming the throttle slot.
+  - Non-2xx responses throw with status/statusText/query in the message
+    rather than returning silently.
+
+**API research (per the plan's rule to verify, not assume).** Fetched
+`https://musicbrainz.org/doc/MusicBrainz_API/Search` and
+`.../MusicBrainz_API/Rate_Limiting` directly (2026-09-01), then confirmed the
+documented shape against two real live calls:
+- Endpoint: `GET https://musicbrainz.org/ws/2/artist/?query=...&fmt=json`
+  (`limit` 1-100, defaults 25; `offset` for pagination).
+- Response: `{ created, count, offset, artists: [...] }`, each artist
+  carrying `id`, `name`, `sort-name`, `type`, `score` (as a JSON number in
+  practice, not a string — the code still defensively coerces either), an
+  optional `country` (ISO2), an optional `disambiguation`, and
+  `life-span: { begin, end, ended }`.
+- Rate limit: MusicBrainz's own page states "each of their client
+  applications never make more than ONE call per second" and that exceeding
+  it can get an IP blocked.
+- User-Agent: MusicBrainz explicitly recommends the form
+  `"Application name/<version> ( contact-url-or-email )"`, e.g.
+  `MyAwesomeTagger/1.2.0 ( me@example.com )` — `musicbrainz.ts`'s constant
+  follows that exact shape, using the project owner's real email.
+
+**Live verification (real calls to musicbrainz.org, not mocked):**
+```
+Query: "IDLES"
+-> 8 candidates. Top result: mbid be465d4f-c28d-4ba1-94ab-ebaada7db8af,
+   name "IDLES", score 100, type "Group", country "GB",
+   disambiguation "post-punk", beginDate "2009" — the correct band.
+   Lower-ranked noise candidates ("Vital Idles", "Bluegrass Idles", "The
+   Idles" x2) scored 75-77, clearly distinguishable by score.
+
+Query: "Chrome" (deliberately generic/ambiguous name)
+-> 10 candidates (of 183 total matches), each with a distinct
+   disambiguation: "US post-punk group, Helios Creed / Damon Edge" (score
+   100, US, 1976-1982), "UK singer, songwriter, MC. ... 'Dance Wiv Me'"
+   (score 82, Person, GB), "German trance duo" (score 78, DE), etc. —
+   exactly the multi-candidate-with-disambiguation behaviour S3.1 needs to
+   reason over.
+```
+Run via a scratchpad harness (`test-musicbrainz.mts`, not committed, matching
+S1.4/S2.0's approach) importing the real exported `lookupArtistCandidates`
+directly — not curl. Also confirmed: a blank-string query returns `[]`
+without a network call; the two live calls plus other assertions totaled
+~1.1s wall time for two full round trips, consistent with the throttle
+enforcing ~1s between request starts.
+
+**Assumed.**
+- `limit` defaults to 10 (not MusicBrainz's own default of 25) — plenty for a
+  disambiguation UI/prompt without over-fetching; caller-overridable.
+- The throttle is process-global (module-scoped `let`), not per-caller —
+  correct for a Worker-style single-process runtime honoring one shared
+  budget against MusicBrainz.
+- `score` is coerced from either a JSON number or a numeric string
+  (defensive — live responses observed it as a number, but MusicBrainz's own
+  docs reference it inconsistently across API versions).
+- No caching/memoization of repeat lookups — out of scope for this step;
+  S3.1 or a later step can add a KV/D1 cache in front of this if repeat
+  lookups for the same name become common.
+
+**Left undone.**
+- No retry/backoff on `503`/"server is currently busy" responses (observed
+  live during verification — MusicBrainz's search index occasionally returns
+  this transiently). Currently surfaces as a thrown `Error`; S3.1's caller
+  will need to decide retry policy.
+- No unit test file added to the repo (not in this step's touch list:
+  `src/sources/musicbrainz.ts` only) — verified via the scratchpad harness
+  above instead, per prior steps' convention.
+
+**Verification performed.**
+```
+npx tsc --noEmit -p tsconfig.json                    # clean, no errors
+npx prettier --check src/sources/musicbrainz.ts       # clean
+
+node --experimental-strip-types test-musicbrainz.mts  # scratchpad harness
+  PASS IDLES returns at least one candidate
+  PASS top IDLES candidate has correct MBID (be465d4f-c28d-4ba1-94ab-ebaada7db8af)
+  PASS top IDLES candidate has high score
+  PASS ambiguous name "Chrome" returns multiple candidates
+  PASS at least one Chrome candidate has a disambiguation string
+  PASS blank name returns empty array without a network call
+```
+Harness lives only in the session scratchpad, not the repo.
+
+**Proposed commit message.**
+```
+Add MusicBrainz artist name lookup (S2.4)
+
+lookupArtistCandidates() queries the real MusicBrainz artist search
+API (verified live against musicbrainz.org, not assumed from
+training data), throttled to MusicBrainz's documented 1 req/sec
+limit with a proper User-Agent. Returns ranked candidates with
+disambiguation strings for S3.1's resolution pass. Confirmed live:
+"IDLES" resolves cleanly to the correct MBID; "Chrome" returns 10+
+genuinely distinct candidates with disambiguation text.
+```
+
+---
+
+## S2.1 — Ticketmaster adapter
+
+**Built.**
+- `src/sources/ticketmaster.ts` — `TicketmasterAdapter implements SourceAdapter`,
+  `source: 'ticketmaster'`. Constructor takes `{ apiKey, db, fetchImpl?,
+  sleepImpl?, now? }` — deliberately not tied to `Env`/`wrangler.jsonc`, so
+  the API key is a plain constructor argument a caller passes in from
+  `env.TICKETMASTER_API_KEY` (a secret, not a `vars` entry — see below).
+  - **Attraction-ID lookup**: `GET /discovery/v2/attractions.json?keyword=&
+    classificationName=Music&size=5`, used only when
+    `SourceArtistRef.tm_attraction_id` is null/missing. Prefers an exact
+    case-insensitive name match among candidates, else the first result. No
+    match → empty result, recorded as a **success** (a legitimate
+    "Ticketmaster doesn't know this artist," not an upstream failure).
+  - **Event fetch + pagination**: `GET /discovery/v2/events.json?attractionId=
+    &classificationName=Music&size=200&page=N`, looping until
+    `page.totalPages` is exhausted (capped at 20 pages as a safety bound).
+  - **Rate limiting**: a simple throttle — tracks `lastRequestAt`, sleeps to
+    enforce a 200ms (5 req/s) minimum gap before every request, attraction
+    lookup and each event page alike.
+  - **On-sale/presale**: `onsale_at` from `sales.public.startDateTime`;
+    `presale_at` picks the **earliest** `startDateTime` across
+    `sales.presales[]` (not just the first array entry).
+  - **Images**: `pickBestImage` prefers a non-fallback `16_9`-ratio image,
+    else the widest, else the first — applied to the event's own `images[]`.
+  - **Status mapping**: `dates.status.code` → `cancelled`/`postponed`
+    (`rescheduled` also maps to `postponed`); everything else left
+    `undefined` so `RawSourceEvent`'s default (`'active'`) applies.
+  - **Country**: Ticketmaster's `_embedded.venues[].country.countryCode` is
+    already ISO 3166-1 alpha-2 — direct passthrough, confirmed via real docs.
+  - **Unusable events dropped, not thrown**: an event missing city, country,
+    or a start date is filtered out in `toRawSourceEvent` rather than passed
+    downstream to fail there or crash the batch.
+  - **`source_health`**: `recordSourceSuccess` on any completed
+    `fetchEvents` call (including "no attraction match"); `recordSourceFailure`
+    with the caught error's message on any thrown error, then re-thrown.
+
+**API research (per the plan's rule to verify, not assume).** Fetched
+developer.ticketmaster.com/products-and-docs/apis/discovery-api/v2/
+(2026-09-01) rather than relying on training data. Confirmed:
+- `/discovery/v2/attractions.json` and `/discovery/v2/events.json`, `apikey`
+  as a **query parameter** (not a header).
+- Event pagination via `_embedded.events[]` + `page.{number,totalPages,size,
+  totalElements}`.
+- Event shape: `dates.start.{localDate,dateTime}`, `dates.timezone`,
+  `dates.status.code`, `sales.public.{startDateTime,endDateTime}`,
+  `sales.presales[].{name,startDateTime,endDateTime}`, `images[]` (with
+  `ratio`/`width`/`height`/`fallback`), `url`, `_embedded.venues[].{name,
+  city.name,country.countryCode,location.{latitude,longitude}}`.
+- Rate limit: confirmed 5000 calls/day, 5 req/s (matches DESIGN.md §6.2
+  exactly), surfaced via `Rate-Limit-*` response headers — not consumed by
+  this adapter (the fixed 200ms throttle already keeps calls under the
+  ceiling without reading response headers).
+- The exact 429/quota-exceeded error body shape wasn't independently
+  confirmed — handled generically: any non-2xx response throws with
+  status/statusText/body-snippet in the message.
+
+**Assumed.**
+- `location.latitude`/`longitude` are strings in the API and are parsed with
+  `Number()`, defaulting to `null` on `undefined`/`NaN` rather than throwing.
+- Attraction-lookup match strategy (exact case-insensitive name, else first
+  candidate) is a reasonable heuristic, not something the docs specify.
+- `classificationName=Music` (capitalized) used for both attraction and
+  event search to keep results scoped to music.
+- Event-level `images[]` (not attraction-level) is the source for
+  `RawSourceEvent.image_url` — `RawSourceEvent` only has one image slot per
+  *event*. Attraction images (fetched internally as part of the lookup
+  response) aren't surfaced anywhere yet — see Left undone.
+
+**Left undone.**
+- No wiring exists yet to actually construct a `TicketmasterAdapter` with a
+  real `apiKey`/`db` — a later integration step, S3.x-adjacent.
+- Attraction-level images are fetched internally but not exposed anywhere —
+  `RawSourceEvent` has no separate "artist/attraction image" slot. If a
+  future images-pipeline step wants those specifically, `SourceAdapter`/
+  `RawSourceEvent` would need a small shape change outside this step's
+  touch list — flagging rather than guessing at an extension.
+- No live verification — blocked on missing `TICKETMASTER_API_KEY` (see
+  below). Whoever wires this into a real deploy should do one live fetch
+  against a real attraction before trusting it in production.
+- Doesn't consume the `Rate-Limit-*` response headers to adapt pacing
+  dynamically — the fixed 200ms/request throttle is simple and sufficient
+  per the task's own guidance.
+
+**Missing credentials — action needed.** No `TICKETMASTER_API_KEY` env var
+or `.dev.vars` entry exists in this repo/environment. The adapter expects
+the key to be passed in as a plain constructor argument
+(`new TicketmasterAdapter({ apiKey: env.TICKETMASTER_API_KEY, ... })`)
+rather than reading `Env` itself, so **no `wrangler.jsonc` change was made
+or needed** — unlike S1.3's `send_email` binding (a resource binding,
+declared in config), an API key is a secret, set via
+`wrangler secret put TICKETMASTER_API_KEY` and never declared in
+`wrangler.jsonc`/`vars`. **To unblock live testing: Rareș needs to obtain a
+free key from developer.ticketmaster.com and run
+`wrangler secret put TICKETMASTER_API_KEY`.**
+
+**Verification performed.**
+```
+npx tsc --noEmit -p tsconfig.json                  # clean, no errors
+npx prettier --check src/sources/ticketmaster.ts   # clean
+
+# Standalone harness (hand-written fixtures matching the real Discovery API v2
+# shape confirmed above — no live key available), 34/34 passed:
+npx tsx test-ticketmaster.mts
+  PASS attraction lookup sends apikey / keyword / classificationName=Music
+  PASS event fetch sends attractionId
+  PASS attraction lookup called exactly once when tm_attraction_id was missing
+  PASS pagination followed totalPages=2 -> 2 event page requests
+  PASS 3 raw events fetched across pages, 1 dropped (missing venue) -> 2 usable
+  PASS starts_at / timezone / city / country (ISO2 passthrough) / venue_name mapped
+  PASS lat/lon parsed as numbers; missing location -> null, not NaN/crash
+  PASS onsale_at from sales.public.startDateTime
+  PASS presale_at picks EARLIEST presale, not first in array
+  PASS ticket_url from event.url
+  PASS status onsale -> undefined (defaults to active); cancelled mapped correctly
+  PASS image_url picks non-fallback 16:9
+  PASS event with no venue is silently dropped, not thrown
+  PASS recordSourceSuccess called once on success path
+  PASS tm_attraction_id present -> attraction lookup skipped entirely
+  PASS no attraction match -> empty array, recorded as success not failure
+  PASS HTTP error propagates and recordSourceFailure called with status in message
+  PASS throttle invoked before subsequent requests, delay within 5 req/s budget
+```
+The harness lived only in the session scratchpad (not committed) — this
+step's touch list is `src/sources/ticketmaster.ts` only.
+
+**Proposed commit message.**
+```
+Add Ticketmaster Discovery API adapter (S2.1)
+
+TicketmasterAdapter implements SourceAdapter: attraction-ID lookup
+(skipped when tm_attraction_id is already known), paginated event
+fetch, on-sale/earliest-presale dates, event image selection, and a
+fixed 200ms (5 req/s) throttle per DESIGN.md §6.2. Records
+source_health via recordSourceSuccess/Failure on every call. API
+shape verified against developer.ticketmaster.com's current Discovery
+API v2 docs, not assumed from training data. No wrangler.jsonc change
+needed — the API key is a plain constructor argument, meant to be
+sourced from a TICKETMASTER_API_KEY secret rather than a vars entry.
+Verified against hand-written fixtures (34/34 checks); no live key
+available in this environment to test against the real API.
+```
+
+---
+
+## S2.3 — Tour-page adapter
+
+**Built.**
+`src/sources/tourpage.ts` — the only file touched, as scoped.
+
+- `checkTourPage(db, artist, previousHash, opts?)` — the orchestration entry
+  point. Fetches `artist.tour_url`, hashes the content (sha1 via
+  `crypto.subtle`, same reasoning as `normalise.ts`: no `nodejs_compat` flag,
+  so `node:crypto` isn't available at runtime), compares against
+  `previousHash`, and returns a discriminated union `TourPageCheckResult`:
+  - `{ status: 'unchanged'; hash }`
+  - `{ status: 'events'; hash; events: RawSourceEvent[]; skipped: number }`
+  - `{ status: 'needs_model_parse'; hash; html }` — page changed but no
+    usable `MusicEvent` JSON-LD found; carries the HTML so a later
+    model-parse step (S3.x/S6.4) doesn't have to re-fetch it. **No model is
+    called from this file.**
+  - `{ status: 'fetch_failed'; error }`
+  Calls `recordSourceSuccess`/`recordSourceFailure` (`../db/queries`) under
+  the `'tourpage'` source name in every branch.
+- `extractJsonLdScripts`, `parseMusicEventsFromJsonLd`,
+  `mapMusicEventsToRawEvents`, `hashTourPageContent` — exported pure
+  functions with no D1/fetch dependency, letting the real-site verification
+  run in plain Node instead of requiring `wrangler dev`/Miniflare.
+- JSON-LD extraction handles a bare `MusicEvent`, an array, a `@graph`
+  wrapper, and `EventSeries.subEvent` — via generic recursive object-tree
+  walking (depth-capped at 6) rather than four special-cased branches, so
+  nesting the spec didn't anticipate (e.g. `ItemList.itemListElement`) is
+  still found.
+- Country mapping: `location.address.addressCountry` is looked up in a
+  ~45-entry name table first (handles both full names and common non-ISO
+  aliases like `"UK"`), and only falls back to trusting a literal 2-letter
+  value if the table has no entry for it (see the bugfix note below for why
+  the ordering matters).
+
+**Interface design decision.** `SourceAdapter` (`fetchEvents(artist) =>
+Promise<RawSourceEvent[]>`) can't express "unchanged" vs. "needs model
+parse" vs. "produced events" — all three would collapse to an empty/
+non-empty array, and it has no way to receive the artist's previous
+`tour_page_hash` at all. Rather than force-fit it, this file exports a
+purpose-built `checkTourPage()` with an explicit result union. Documented in
+the file's header comment as a deliberate choice, not an oversight — a thin
+`SourceAdapter`-shaped wrapper around it is a small addition later if some
+caller wants that shape too.
+
+**Two real bugs found and fixed during the three-site verification (not
+hypothetical).**
+1. The Last Dinner Party's own site emits `location.address` as a bare
+   string (`"London, United Kingdom  "`) instead of the spec'd
+   `PostalAddress` object — all 41 `MusicEvent` nodes on that page failed to
+   map until `parseAddressString()` was added (splits on the last two
+   comma segments: country, then city).
+2. IDLES's Songkick page has a `MusicEvent` with `addressCountry: "UK"` —
+   not actually valid ISO2 (`GB` is). The original code passed any 2-letter
+   string straight through uppercased; fixed by trying the name-table
+   lookup *before* the bare-2-letter passthrough, so known non-ISO aliases
+   resolve correctly while genuinely valid codes still pass through
+   untouched.
+
+**Three real sites tested (per the plan's explicit instruction to use real
+sites, not a synthetic fixture).**
+
+| Site | URL | JSON-LD shape | Result |
+|---|---|---|---|
+| IDLES, via Songkick | songkick.com/artists/1352869-idles | 4 `<script type="application/ld+json">` blocks, bare `MusicEvent` objects | 3 `MusicEvent` nodes, all 3 mapped. One event's `performer` field named a co-headliner ("Deftones") rather than IDLES (festival-bill quirk) — harmless since `RawSourceEvent` never reads `performer`/`name`, but worth knowing this exists. |
+| Radiohead, via Songkick | songkick.com/artists/253846-radiohead | Same shape as above | 2 `MusicEvent` nodes, both mapped — but both were for unrelated small artists at a Brooklyn venue in 2013, not Radiohead. Radiohead currently has no upcoming shows; the page appears to fall back to an unrelated recommendation widget's JSON-LD. **A real risk**: an aggregator page can emit structurally-valid `MusicEvent` data for a completely different artist. See Left undone. |
+| The Last Dinner Party, own site | thelastdinnerparty.co.uk/tour | 2 blocks, one large array/`@graph`-style listing, `location.address` as a bare string (bug #1 above) | 41 `MusicEvent` nodes, all 41 mapped after the address-string fix. Closest analog to the actual S2.3 use case (an artist's own site, not an aggregator). |
+
+Other candidates tried and rejected during the search: `metallica.com/tour`
+(200 but no JSON-LD), `bandsintown.com/a/*` (403 on every attempt —
+Cloudflare bot protection blocks a plain `fetch`), `fontainesdc.com`,
+`royalbloodband.com`, `wetlegband.com`, `wolfalice.co.uk`,
+`thewombats.co.uk`, `foals.co.uk` (all reachable, none carried `MusicEvent`
+JSON-LD) — consistent with DESIGN.md §6.2's own expectation ("roughly half
+of a 25-band list to publish usable structured data").
+
+**Assumed.**
+- Hashing the *raw fetched HTML* (not a normalised/whitespace-stripped
+  version) for the `tour_page_hash` comparison — matches "hash the fetched
+  content" literally; means a page whose only change is e.g. an
+  ad-tracking query-string timestamp will look "changed" and trigger a
+  re-parse. Not fixed here since over-normalising risks missing real diffs.
+- `sameAs`/`performer` mismatches (Songkick finding above) are not
+  filtered — `RawSourceEvent` has no field for "which artist does this
+  actually belong to" beyond what the caller already knows, and JSON-LD
+  gives no reliable signal to cross-check against.
+- `presale_at` is always `null` — schema.org's `Offer` has no standard
+  presale-date property; only `availabilityStarts`/`validFrom` map to
+  `onsale_at`.
+- Regex-based `<script type="application/ld+json">` extraction instead of
+  Cloudflare's `HTMLRewriter` global — `HTMLRewriter` only exists inside
+  workerd, which would have made the required real-site verification
+  impossible to run outside `wrangler dev`/Miniflare. `<script>` bodies
+  practically never contain a literal unescaped `</script>`, so the
+  non-greedy regex is safe in practice; documented as a deliberate tradeoff.
+- Country-name table (~45 entries) covers Western/Central Europe, Nordics,
+  and a few major non-European touring markets (US/CA/AU/NZ/JP/MX/BR) per
+  DESIGN.md §6.2's coverage list — not exhaustive. An unmapped country name
+  skips just that one event (counted in `skipped`), not the whole page.
+
+**Left undone.**
+- No filtering for the "aggregator page returns unrelated artist's events"
+  failure mode found on the Radiohead Songkick page. Genuine risk if
+  `artist.tour_url` is ever pointed at a third-party aggregator rather than
+  the artist's own site — which is exactly what DESIGN.md §6.2 intends
+  `tour_url` to be, so it may be self-limiting in practice, but nothing here
+  would catch it if it happened. A future improvement would cross-check
+  `MusicEvent.performer.name` against `artist.name` and drop mismatches —
+  not done here since it's a heuristic with its own false-negative risk
+  (support-act billing, alternate act names) and wasn't asked for.
+- No caller exists yet (S3.2, not built) to actually invoke
+  `checkTourPage()` and persist `hash`/`events`/`needs_model_parse` results.
+- No handling for tour pages that require JavaScript to render their
+  JSON-LD (a plain `fetch` won't see it) — out of scope; `bandsintown.com`
+  itself 403'd every attempt in this environment, so it wasn't testable
+  here either way.
+
+**Verification performed.**
+```
+npx tsc --noEmit -p tsconfig.json             # clean
+npx prettier --check src/sources/tourpage.ts  # clean
+
+# Three real sites fetched live and run through the actual exported
+# functions (extractJsonLdScripts / parseMusicEventsFromJsonLd /
+# mapMusicEventsToRawEvents / hashTourPageContent), via a scratchpad
+# harness (node --experimental-strip-types), not a synthetic fixture:
+IDLES (Songkick)                 -> 3 MusicEvent nodes, 3 mapped, 0 skipped
+Radiohead (Songkick)             -> 2 MusicEvent nodes, 2 mapped, 0 skipped
+The Last Dinner Party (own site) -> 41 MusicEvent nodes, 41 mapped, 0 skipped
+
+# checkTourPage() orchestration verified against a stubbed D1 (logging
+# prepare().bind().run()/first() calls) and injected fetchImpl, covering
+# all four TourPageCheckResult branches:
+PASS events        - MusicEvent found, source_health success recorded
+PASS unchanged     - same content + previousHash = prior hash -> no events
+PASS needs_model_parse - no JSON-LD at all -> html handed back, no model called
+PASS fetch_failed  - thrown fetch error -> source_health failure recorded
+PASS fetch_failed  - HTTP 404 response -> treated as failure, not silently empty
+```
+The harness and the three fetched HTML files live only in the session
+scratchpad, not the repo (touch list is `src/sources/tourpage.ts` only).
+
+**Proposed commit message.**
+```
+Add tour-page adapter with JSON-LD MusicEvent parsing (S2.3)
+
+checkTourPage() fetches artist.tour_url, hashes it against the
+stored tour_page_hash, and either reports unchanged, parses
+MusicEvent JSON-LD (bare object / array / @graph / EventSeries) into
+RawSourceEvent[] with no model call, or signals needs_model_parse for
+a later step to handle. Verified against three real sites (IDLES and
+Radiohead via Songkick, The Last Dinner Party's own site) rather than
+a synthetic fixture, which surfaced and fixed two real bugs: a bare
+string location.address (not the spec'd PostalAddress object) and a
+non-ISO "UK" country code that needed name-table lookup to beat a
+naive 2-letter passthrough.
+```
