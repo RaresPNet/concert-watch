@@ -73,6 +73,16 @@ export async function setSubscriberLastHeartbeatAt(db: D1Database, id: number, a
 	await db.prepare(`UPDATE subscribers SET last_heartbeat_at = ? WHERE id = ?`).bind(at, id).run();
 }
 
+/** S5.3: resolves an MCP bearer token straight back to the one subscriber it was minted for, or `null` if no subscriber holds it (an unknown/revoked token). This is the only lookup a subscriber-scoped MCP request ever needs -- it never takes a subscriber id as input. */
+export async function getSubscriberByMcpToken(db: D1Database, token: string): Promise<SubscriberRow | null> {
+	return db.prepare(`SELECT * FROM subscribers WHERE mcp_token = ?`).bind(token).first<SubscriberRow>();
+}
+
+/** S5.3: sets (or replaces) one subscriber's MCP bearer token. The caller is responsible for generating `token` with a CSPRNG -- see `mint_subscriber_token` in `src/mcp/server.ts`, the only current caller. */
+export async function setSubscriberMcpToken(db: D1Database, id: number, token: string): Promise<void> {
+	await db.prepare(`UPDATE subscribers SET mcp_token = ? WHERE id = ?`).bind(token, id).run();
+}
+
 export async function appendSubscriberPreference(db: D1Database, id: number, note: string): Promise<void> {
 	// Appends free text, one line per call — see DESIGN.md §11.3.
 	await db
@@ -582,6 +592,37 @@ export async function getReachability(db: D1Database, cityKey: string): Promise<
 }
 
 /**
+ * S5.5: backs the `get_current_routes` MCP tool -- every currently-stored
+ * reachability row for one origin airport, or (when `originIata` is
+ * omitted) every row for every origin. This is the "what's already there"
+ * side of the diff-not-rebuild refresh: the refreshing model reads this
+ * before researching, so it only needs to submit rows that actually changed
+ * to `refresh_reachability` instead of re-deriving the whole table.
+ */
+export async function getReachabilityByOrigin(db: D1Database, originIata?: string): Promise<ReachabilityRow[]> {
+	if (originIata) {
+		const result = await db
+			.prepare(`SELECT * FROM reachability WHERE origin_iata = ? ORDER BY city_key`)
+			.bind(originIata)
+			.all<ReachabilityRow>();
+		return result.results;
+	}
+	const result = await db.prepare(`SELECT * FROM reachability ORDER BY origin_iata, city_key`).all<ReachabilityRow>();
+	return result.results;
+}
+
+/**
+ * S5.5: the deletion half of the diff-refresh. A discontinued route isn't
+ * expressible by omission -- `upsertReachability` only ever adds or updates
+ * a row, so a route that no longer exists needs an explicit delete or it
+ * just sits in D1 claiming a tier it no longer has. Called from
+ * `refresh_reachability`'s `remove_reachability` list.
+ */
+export async function deleteReachability(db: D1Database, cityKey: string, originIata: string): Promise<void> {
+	await db.prepare(`DELETE FROM reachability WHERE city_key = ? AND origin_iata = ?`).bind(cityKey, originIata).run();
+}
+
+/**
  * S4.5: `get_reachability(city)`'s lookup when the model's free-text city
  * doesn't match a `city_key` exactly. `city_key` is `"<country>:<city>"`
  * (DESIGN.md §4, e.g. `"gb:leeds"`) with no punctuation in the city part,
@@ -613,6 +654,19 @@ export async function upsertOrigin(db: D1Database, input: OriginRow): Promise<vo
 export async function getAllOrigins(db: D1Database): Promise<OriginRow[]> {
 	const result = await db.prepare(`SELECT * FROM origins`).all<OriginRow>();
 	return result.results;
+}
+
+/**
+ * S5.5: symmetric with `deleteReachability` -- an origin airport dropping
+ * out entirely (unlikely, but expressible) needs the same explicit-delete
+ * treatment rather than silent omission. `reachability` rows are not
+ * cascade-deleted here; a caller removing an origin is expected to also
+ * list its reachability rows in `remove_reachability` if it wants those
+ * gone too, same as every other table in this file (no ON DELETE CASCADE
+ * in the schema).
+ */
+export async function deleteOrigin(db: D1Database, iata: string): Promise<void> {
+	await db.prepare(`DELETE FROM origins WHERE iata = ?`).bind(iata).run();
 }
 
 // ---------------------------------------------------------------------------

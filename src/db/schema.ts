@@ -19,6 +19,8 @@ export interface SubscriberRow {
 	created_at: string;
 	/** S4.8 (migration 0004): last time the 30-day heartbeat fired for this subscriber, so it doesn't refire daily once silence crosses the threshold. */
 	last_heartbeat_at: string | null;
+	/** S5.3 (migration 0006): this subscriber's own MCP bearer token, if one has been minted. NULL until `mint_subscriber_token` sets it. A request bearing this token is treated as this subscriber and this subscriber alone -- see `src/mcp/server.ts`. */
+	mcp_token: string | null;
 }
 
 export type ArtistCoverage = 'api' | 'dark' | 'unknown';

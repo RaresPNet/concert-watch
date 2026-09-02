@@ -101,7 +101,19 @@ export async function persistRawEvent(db: D1Database, raw: RawSourceEvent, artis
 	return { kind, event_id: eventId, fingerprint: result.event.fingerprint };
 }
 
-async function pollOneArtist(artist: ArtistRow, deps: PollDeps, nowIso: string): Promise<PollArtistResult> {
+/**
+ * Runs every enabled source (Ticketmaster + tour page) for one artist and
+ * persists whatever comes back. Exported (S5.1): `acquireArtist`
+ * (`src/core/acquire.ts`) calls this directly for a single just-added artist
+ * rather than re-implementing the same fetch-then-persist sequence
+ * `pollAll` already has — including the tour-page hash+parse behaviour that
+ * makes this safe to call the moment an artist is added: `artist.tour_page_hash`
+ * is NULL for a brand new artist, so `checkTourPage` below always takes its
+ * `status: 'events'` (or `needs_model_parse`) branch, never `unchanged` — the
+ * page's current content is parsed on this very first call, not merely
+ * hashed-and-deferred to the next scheduled poll.
+ */
+export async function pollOneArtist(artist: ArtistRow, deps: PollDeps, nowIso: string): Promise<PollArtistResult> {
 	const outcomes: PollEventOutcome[] = [];
 	const errors: string[] = [];
 	let needsModelParse = false;

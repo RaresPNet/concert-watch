@@ -3685,3 +3685,1001 @@ done-when scenario end to end, plus cap-breach/retry-storm/budget-
 degrade coverage; a live Anthropic round trip remains unverified, per
 this codebase's standing precedent for the reply path.
 ```
+
+## S5.1 — Acquisition-time ingest
+
+**Built.**
+- `src/core/acquire.ts` (new) — `acquireArtist(artistId, deps)`. `deps` is
+  exactly `PollDeps` (`src/core/poll.ts`'s own dependency shape: an optional
+  `ticketmasterAdapter`, `db`, an optional `now`, an optional
+  `tourPageFetchImpl`) reused as-is rather than inventing a parallel type.
+  For one artist it:
+  1. Loads the artist row; returns `found: false` immediately if the id
+     doesn't exist (defensive -- `add_artist` always passes a freshly
+     resolved/inserted id, so this path isn't expected to trigger in
+     practice).
+  2. Calls the newly-exported `pollOneArtist(artist, deps, nowIso)`
+     (`src/core/poll.ts`) -- the exact same fetch-Ticketmaster /
+     check-and-parse-tour-page / `persistRawEvent` sequence `pollAll` already
+     runs per artist, now reused instead of duplicated. This is what closes
+     the "hash-and-skip" trap the task named: a brand-new artist's
+     `tour_page_hash` is `NULL`, so `checkTourPage`'s
+     `previousHash !== null && previousHash === hash` unchanged-check can
+     never be true on this first call -- it always falls through to parsing
+     the page's current JSON-LD (or flags `needs_model_parse`), so whatever
+     dates are already on the page today are ingested today, not silently
+     deferred to a tomorrow that would then see "unchanged" and never look.
+  3. Calls `clusterToursForArtist(db, artistId, nowIso)` (`src/core/tours.ts`,
+     unmodified) to assign the newly-persisted events to tours.
+  4. Reads back `getToursForArtist`, keeps only tours that are still active
+     (`last_date IS NULL OR last_date >= nowIso` -- the same predicate
+     `getOpenTourForArtist`'s SQL already uses, duplicated here as a plain JS
+     filter rather than adding a new query), and for each calls
+     `attachReachabilityToTour` (`src/core/reach.ts`, unmodified) to find the
+     single best (lowest tier, then earliest date) upcoming date across all
+     of them.
+  5. Returns `{ artist_id, found, tour_count, date_count,
+     nearest_reachable_date, errors, needs_model_parse }` -- a small, shaped
+     summary, not a row dump, consistent with S4.5's "tools return decisions,
+     not data" principle even though this function isn't itself a tool.
+- `src/core/poll.ts` — `pollOneArtist` changed from a private, unexported
+  function to an exported one (added a doc comment explaining why; no
+  behavioural change, `pollAll` calls it exactly as before). This is the only
+  change to this file.
+- `src/agent/tools.ts` — `add_artist`'s handler now calls `acquireArtist`
+  immediately after resolving/inserting the artist and recording the
+  watchlist entry (both for a newly-added artist and for "already watching"
+  -- an existing-but-previously-dark artist row deserves the same immediate
+  check, and re-running acquisition against an artist that's already fully
+  up to date is a correctness no-op: `persistRawEvent` upserts by
+  fingerprint, and `clusterToursForArtist` only touches events still sitting
+  at `tour_id IS NULL`). Builds `PollDeps` inline from `AgentToolContext`:
+  `new TicketmasterAdapter({ apiKey: ctx.ticketmasterApiKey, db: ctx.db,
+  fetchImpl: ctx.fetchImpl })` and `tourPageFetchImpl: ctx.fetchImpl`, with
+  `now` adapted from `ctx.now`'s `() => Date` shape to the `() => string`
+  (ISO) shape `PollDeps` expects. `AddArtistOutput`'s resolved branch gained
+  an `acquisition: { tour_count, date_count, nearest_reachable_date }` field
+  so the reply has something to say. The tool's `description` string was
+  reworded to mention this (no step numbers, no file/function names, per the
+  task's rule 5) -- it now says the tool "immediately checks that band's
+  known tour sources" and describes the summary in plain terms.
+
+**Assumed / judgment calls.**
+- **No `new_tour`/`new_dates` notification suppression flag was added
+  anywhere** -- not a parameter on `clusterToursForArtist`, not a
+  pre-notified marker column on `tours` (which would have meant a migration,
+  outside this step's touch list). Suppression instead falls out of the
+  existing pipeline shape: `acquireArtist` never calls
+  `runNotificationPass` (`src/core/notify.ts`) at all, and by the time
+  `clusterToursForArtist` returns, every event it just clustered has a real,
+  non-NULL `tour_id` -- which means `getFutureActiveEventsWithoutTour`
+  (the `tour_id IS NULL` query every future clustering pass reads from) can
+  never surface them again. So even a later scheduled-poll orchestrator
+  (not built yet -- confirmed by grepping the repo: nothing anywhere calls
+  `clusterTours`/`runNotificationPass` together today, S3.2's and S4.7's own
+  PROGRESS.md entries flag this same gap and defer it to this step) that
+  naively runs `clusterTours` then `runNotificationPass` over "artists
+  touched this run" cannot re-notify these events, because they're no longer
+  pending by the time any such pass would look. This was chosen over a flag
+  because it requires touching nothing outside this step's file list and
+  because two independent signals for "was this already surfaced" (a flag
+  *and* the tour_id-assignment fact) would be exactly the kind of drift risk
+  `submit_digest`'s own S4.7 entry already argued against for a similar
+  idempotency question.
+- **`acquireArtist` is called unconditionally after every successful
+  resolution**, including when `already_watching` is true. The task's wording
+  ("`add_artist` calls this after a successful resolution") doesn't gate it
+  on newness, and gating it would leave a previously-added-but-never-polled
+  artist's confirmation reply just as empty as before this step for the
+  "add it again" / re-ask case.
+- **`tour_count`/`date_count` are scoped to currently-active tours only**
+  (not every tour the artist has ever had), matching what a subscriber
+  actually wants to hear about in a confirmation reply -- a tour that ended
+  two years ago isn't "what's already on."
+- **`nearest_reachable_date` ranks by reachability tier first, date second**,
+  mirroring `attachReachabilityToTour`'s own `top_three` ordering exactly
+  (lowest tier wins; ties broken by earliest `starts_at`), rather than
+  inventing a different ranking for this one field.
+- **Errors from either source (Ticketmaster/tour page) are surfaced in the
+  result but do not block acquisition** -- same as `pollOneArtist`'s own
+  existing behaviour (one source failing doesn't abort the artist). An
+  artist added while both sources are down still gets added to the
+  watchlist; the confirmation reply would show `tour_count: 0` and the
+  errors are available for logging, not silently dropped.
+
+**Left undone.**
+- No live network/API call was exercised (no `TICKETMASTER_API_KEY` secret
+  available in this environment) -- consistent with this codebase's standing
+  precedent (S1.3/S2.1/S4.6 etc.) of not touching live infrastructure or
+  quota for a verification step. `acquireArtist`'s logic was traced by
+  reading, not run against a fixture harness in this pass -- a gap, flagged
+  rather than silently skipped; a fixture-harness pass (fake `TicketmasterAdapter`
+  + fake `tourPageFetchImpl` against the existing SQLite `D1Database` shim,
+  the same style S3.2/S3.3/S4.6's own entries used) would be the natural next
+  step if this needs stronger verification before S5.2 builds on it.
+- `npx tsc --noEmit -p tsconfig.json` passes with no errors introduced by
+  this change (ran clean, no output).
+
+**Proposed commit message.**
+```
+Add acquisition-time ingest so add_artist reports what's already on (S5.1)
+
+New src/core/acquire.ts: acquireArtist(artistId, deps) fetches every
+enabled source for one artist right away -- reusing poll.ts's now-
+exported pollOneArtist (fetch + persistRawEvent) and tours.ts's
+clusterToursForArtist unchanged -- so a freshly added band's tour
+page is hashed AND parsed in the same pass (tour_page_hash starts
+NULL, so checkTourPage can never see "unchanged" on this first call)
+instead of only being hashed and picked up by tomorrow's poll.
+add_artist (agent/tools.ts) now calls this after resolving/adding a
+band and returns a compact acquisition summary (active tour count,
+total date count, single most reachable upcoming date) so the
+confirmation reply can say what's already on. No notification rows
+are written for any of it: acquireArtist never calls
+runNotificationPass, and clustering hands every acquired event a
+real tour_id in the same pass, so no future clustering run can see
+them as pending again either -- no new flag or column needed.
+```
+
+## S5.3 — Agent tools over MCP, per-subscriber tokens
+
+**Built.**
+- `migrations/0006_subscriber_mcp_token.sql` — adds `subscribers.mcp_token`
+  (nullable `TEXT`) plus a separate `CREATE UNIQUE INDEX`. Learned the hard
+  way (a real SQLite engine, not assumed): `ALTER TABLE ... ADD COLUMN ...
+  UNIQUE` is rejected outright ("Cannot add a UNIQUE column"), so the
+  uniqueness constraint had to be a standalone index instead of inline on
+  the column.
+- `src/db/schema.ts` — `SubscriberRow.mcp_token: string | null`.
+- `src/db/queries.ts` — `getSubscriberByMcpToken(db, token)` (the only
+  lookup a subscriber-scoped request ever needs — token in, subscriber out,
+  no id argument anywhere) and `setSubscriberMcpToken(db, id, token)`.
+- `src/mcp/server.ts`:
+  - `McpEnv` gained `ANTHROPIC_API_KEY?`/`TICKETMASTER_API_KEY?`, read the
+    same way `MCP_AUTH_TOKEN` already was (plain secrets, no
+    `wrangler.jsonc` binding) — the agent tools need both (`add_artist` via
+    `resolveArtist`, `web_search`).
+  - `agentInputSchemaToZodShape()` — a narrow, hand-written converter from
+    the JSON-Schema `input_schema` shape `src/agent/tools.ts`'s
+    `AnthropicToolDef`s already carry into the Zod raw shape
+    `McpServer.registerTool` needs. Only understands the handful of leaf
+    types the current catalogue actually uses (string/integer/number/
+    boolean, `enum`, `required`) — deliberately not a general JSON-Schema-
+    to-Zod library, since the task's own "wire to it, don't duplicate it"
+    instruction is about tool logic, not schema translation, and a few
+    dozen lines beat a new dependency for nine known shapes.
+  - `buildSubscriberMcpServer(db, env, subscriberId)` — registers every
+    `AGENT_TOOLS` entry (imported from `src/agent/tools.ts`, unmodified) via
+    `callAgentTool`, closing over one `AgentToolContext` whose
+    `subscriberId` is fixed for the life of the request and is never read
+    from tool input. None of the nine tools take a `subscriber_id`
+    parameter in their JSON-Schema `input_schema` to begin with, so there
+    was nothing to strip — the safety property ("no argument to put another
+    subscriber's id into") already existed in `tools.ts`; this file just
+    never gives a caller a channel to override it.
+  - `mint_subscriber_token` — new admin-only tool (registered on
+    `buildMcpServer`, alongside the existing scheduled-task tools) that
+    generates a 32-byte token via `crypto.getRandomValues` (Web Crypto — no
+    `nodejs_compat`, no `node:crypto`; `wrangler.jsonc` confirmed unchanged)
+    hex-encodes it, and calls `setSubscriberMcpToken`. This is the "script
+    or documented `wrangler d1 execute` line" the task asked for, done
+    in-band instead: the task's own phrasing ("Web Crypto... this runs in a
+    Cloudflare Worker") reads as a hint that minting should happen inside
+    the Worker, not from a local Node script, and an MCP tool the admin
+    token can already call needed no new file (the touch list has no room
+    for a `scripts/` addition). **To mint a subscriber's token**: call
+    `mint_subscriber_token` with `{ "subscriber_id": <id> }` through any MCP
+    client authenticated with the admin token (`POST /mcp/<MCP_AUTH_TOKEN>`)
+    — e.g. Claude Code's own MCP tool-call UI, or a raw JSON-RPC
+    `tools/call` POST. It returns `{ subscriber_id, email, token }`; hand
+    that subscriber a connection URL of `https://<worker-domain>/mcp/<token>`.
+    Re-minting replaces the previous token outright (confirmed by the
+    harness below — the old token immediately stops working), so there is
+    no manual revocation step to forget.
+  - `routeMcpRequest` now tries the admin token first (unchanged equality
+    check), then falls back to `getSubscriberByMcpToken`; a token matching
+    neither still gets the same 404 an unauthenticated request always got
+    (this file's existing 401-vs-404 reasoning, unchanged).
+  - `handleSubscriberMcpRequest` mirrors `handleMcpRequest`, just pointed at
+    `buildSubscriberMcpServer`.
+
+**Assumed.**
+- **A fresh `McpServer` (and therefore a fresh `WebSearchState`) per HTTP
+  request** — matching this file's own pre-existing "a fresh McpServer
+  serves every call" model (see the file's header comment, unchanged by
+  this step). Consequence: `web_search`'s "3 calls per email" cap
+  (`src/agent/tools.ts`, unmodified) only ever sees a cap of 3 calls within
+  one MCP tool call, since nothing carries a `WebSearchState` across
+  separate requests here. The email reply path (S4.6) is unaffected — this
+  gap is specific to reaching `web_search` through MCP, which is new in
+  this step. Flagged rather than silently accepted; a real fix would need
+  session-scoped state, out of this step's touch list.
+- **No rate limiting on `mint_subscriber_token` calls** — same posture as
+  every other admin tool in this file already had (the admin token is a
+  trusted secret; nothing new was added to distrust it more than the
+  existing eight tools already are).
+- **`add_artist`'s default priority / ambiguous-candidate behaviour is
+  unchanged** — that tool's own logic lives entirely in `src/agent/tools.ts`
+  and was not touched.
+- Token comparison for both the admin token and the subscriber token is a
+  plain equality check (`===`, or a D1 `WHERE mcp_token = ?` lookup), not
+  constant-time. This matches the admin token's existing pre-this-step
+  comparison exactly (`routeMcpRequest` already did a plain `!==` check
+  before this step); not a new gap this step introduces, but noted since a
+  second credential kind now shares the same property.
+
+**Left undone.**
+- `add_artists` (bulk add, S5.2) is not yet exposed — S5.2 was still
+  landing in a parallel session while this step ran, exactly per this
+  task's own instructions not to block on it. Once it exists in
+  `AGENT_TOOLS`, it is exposed automatically (the loop that registers
+  subscriber tools iterates `AGENT_TOOLS`, not a hand-picked list) with no
+  further change to this file — worth a quick tsc/harness re-run once S5.2
+  lands, but no code change is anticipated.
+- Rule 5 (runtime string cleanup) was **not** applied to the nine tools
+  imported from `src/agent/tools.ts` — their descriptions still cite
+  `DESIGN.md` sections and internal function names. That file was
+  explicitly off-limits for this step (S5.4's own "Depends on. S5.3, so it
+  covers the expanded set" says as much) and is now itself the expanded
+  set S5.4 needs to sweep. This step's own new string
+  (`mint_subscriber_token`'s description) was written self-contained per
+  Rule 5 from the start.
+- No live Anthropic/Ticketmaster round trip was exercised (no credentials
+  in this environment, consistent with every prior model-touching step's
+  documented precedent) — `add_artist`/`web_search` reachable through a
+  subscriber token were verified to route and dispatch correctly, not to
+  produce a real resolution/search result.
+
+**Verification performed.**
+```
+npx tsc --noEmit -p tsconfig.json                                     # clean
+npx prettier --check src/mcp/server.ts src/db/schema.ts src/db/queries.ts  # clean
+
+# Integration harness (node:sqlite DatabaseSync D1Database shim, real
+# migrations/0001-0006 replayed via raw.exec, run through tsx with
+# --experimental-sqlite -- same convention as every prior D1-backed step's
+# harness) driving routeMcpRequest end to end over real Request/Response
+# objects (no shortcuts into buildSubscriberMcpServer's internals). Two
+# subscribers, two watchlists, real JSON-RPC tools/call bodies. Written to
+# the repo root as test-s53-mcp.mts, run, then deleted (git status clean
+# afterward; not in this step's touch list):
+NODE_OPTIONS=--experimental-sqlite npx tsx test-s53-mcp.mts
+  DONE-WHEN S5.3: two subscriber tokens each see only their own watchlist
+  PASS token1 sees exactly its own artist
+  PASS token2 sees exactly its own artist
+  PASS subscriber token refused calling a scheduled-task tool (status)
+  PASS subscriber token refused calling submit_digest for another subscriber
+  PASS admin token can call status
+  PASS admin token does NOT expose the subscriber agent tool list_watchlist
+  PASS unknown token returns 404
+  PASS mint_subscriber_token returns a token
+  PASS newly minted token immediately works and sees the right watchlist
+  PASS old token1 is now dead (mint replaced it)
+
+10 passed, 0 failed
+```
+
+**Proposed commit message.**
+```
+Expose agent tools over MCP with per-subscriber tokens (S5.3)
+
+subscribers.mcp_token (migrations/0006) is a new per-person bearer
+credential, CSPRNG-minted by a new admin-only mint_subscriber_token
+MCP tool (crypto.getRandomValues -- Web Crypto, not node:crypto,
+since this runs in the Worker). routeMcpRequest now tries the
+existing shared MCP_AUTH_TOKEN first (unchanged, still fronts the
+eight scheduled-task tools) and falls back to resolving mcp_token to
+one subscriber; a request bearing a subscriber token gets a fresh
+McpServer exposing S4.5's AGENT_TOOLS catalogue (src/agent/tools.ts,
+untouched) instead, with subscriberId fixed from the token rather
+than taken from any tool argument -- none of the nine tools ever
+exposed a subscriber_id parameter to begin with, so a subscriber
+token has no channel to act as anyone else. A small hand-written
+JSON-Schema-to-Zod shape converter bridges tools.ts's Anthropic-style
+input_schema into what McpServer.registerTool expects, covering only
+the leaf types the current catalogue actually uses rather than
+pulling in a conversion library. Verified end to end against a real
+D1Database shim: two subscriber tokens each see only their own
+watchlist, a subscriber token is refused calling a scheduled-task
+tool, and a freshly minted token works immediately while the token it
+replaced stops working.
+```
+
+## S5.5 — Reachability refresh: read tool and quarterly cadence
+
+**Built.**
+- `get_current_routes(origin_iata?)` — new scheduled-task-only MCP tool in
+  `src/mcp/server.ts`. Returns every reachability row currently stored in D1
+  for one origin airport (`origin_iata`, e.g. `"CLJ"`), or every row for every
+  origin if the argument is omitted. Each row comes back as
+  `{ origin_iata, destination_city_key, tier, route_note, computed_at }`.
+  Backed by a new `getReachabilityByOrigin(db, originIata?)` in
+  `src/db/queries.ts`.
+- `refresh_reachability` now accepts a genuine partial update plus explicit
+  removals. `origins` and `reachability` are both now optional (a refresh
+  touching only one side doesn't need to pass an empty array for the other).
+  Two new optional arrays express deletion: `remove_reachability` (a list of
+  `{city_key, origin_iata}` pairs) and `remove_origins` (a list of `iata`
+  codes) — wired to two new query functions, `deleteReachability` and
+  `deleteOrigin`.
+- Cadence: the tool description and the file's own header comment ("the
+  monthly reachability refresh" → "the quarterly reachability refresh") now
+  say quarterly, with the IATA-seasonal-boundary reasoning from the plan
+  (late March / late October) stated directly in the tool description, not
+  just here.
+- `data/routes.json`'s `$schema_note` now says explicitly that this file is
+  one-time/occasional seed data for `scripts/seed-reach.ts`, not something
+  the MCP server reads or `refresh_reachability` writes — see "Investigated"
+  below for why.
+
+**Investigated — was a partial update already possible, and is removal
+expressible?** Before this step, `refresh_reachability`'s handler looped over
+whatever `origins`/`reachability` it was handed and called
+`upsertOrigin`/`upsertReachability` on each — it never deleted anything and
+never required the full set, so a partial *update* (add/change rows) was
+already technically possible by only submitting the changed rows. What was
+missing, and is the actual "make it a diff not a rebuild" gap the plan cares
+about, is: (1) **no way to discover what's already there** — the tool had no
+read path, so the only way to know what to diff against was to ask the model
+to re-derive the whole ~477-route table from scratch every time (which is
+literally what `SCHEDULED_TASK.md` §4 currently instructs — see below); and
+(2) **removal was not expressible at all** — omitting a row from the
+`reachability` array left it untouched in D1 forever, so a discontinued route
+(a real thing DESIGN.md's own reasoning anticipates — routes come and go on
+seasonal schedule changes) could never be un-said. Both gaps are now closed:
+`get_current_routes` gives the model something to diff against, and
+`remove_reachability`/`remove_origins` give it an explicit way to say "this
+row is gone," distinct from "I have nothing new to say about this row."
+
+**Investigated — does `data/routes.json` get touched at runtime?** No. Traced
+`refresh_reachability`'s persistence path: it calls `upsertOrigin` /
+`upsertReachability` (`src/db/queries.ts`), both of which write straight to
+D1's `origins` / `reachability` tables (`migrations/0001_init_schema.sql`).
+Neither those two functions nor anything else in `src/mcp/server.ts` opens,
+reads, or writes `data/routes.json`. That file is consumed exactly once per
+run of `scripts/seed-reach.ts` (S1.2), a Node script invoked by hand via
+`wrangler d1 execute`, which derives `tier`/`route_note` per
+`(city_key, origin_iata)` from the raw route facts in `routes.json` +
+`origins.json` and does a full `DELETE`-then-reinsert into D1. A Cloudflare
+Worker has no filesystem write access to its own source tree, so even if I
+wanted `refresh_reachability` to keep `routes.json` in sync with what the
+model researches, there is no runtime mechanism to do that — the file can
+only change via a commit + redeploy. This is also *why* `get_current_routes`
+reads D1's `reachability` table rather than `routes.json`: D1 is the only
+copy of "current route state" that's actually live and actually gets updated
+by a refresh, so it's the only one worth diffing against. `routes.json`
+stays exactly what S1.2 already described it as — one-time seed data — and I
+only touched its `$schema_note` to say so explicitly, per the touches list
+allowing it and to stop a future reader from assuming it's kept live.
+
+**A real gap this surfaced, deliberately not fixed here (out of touches).**
+`get_current_routes` reports `route_note` as free text (e.g. `"direct
+CLJ→LBA, Wizz Air, ~3/wk"`), which is where "airline" and "frequency" the
+plan asked for actually live — D1's `reachability` table has no separate
+structured columns for them (`city_key, origin_iata, tier, route_note,
+computed_at` is the whole row, per `migrations/0001_init_schema.sql`), and
+adding columns needs a migration, which is outside this step's touches list
+(`src/mcp/server.ts`, `src/db/queries.ts`, `data/routes.json` only — no
+`migrations/`). So the read tool satisfies "origin, destination, airline,
+frequency" in spirit (everything is present in the response, airline/
+frequency embedded in prose) but not as separately-queryable/typed fields.
+If a future step wants structured airline/frequency columns, that's a
+schema change (new migration) plus updating `upsertReachability`'s shape —
+flagging rather than doing it here, since it wasn't in scope and would touch
+a fourth file.
+
+**Also surfaced, deliberately not fixed here.** `SCHEDULED_TASK.md` §4 is
+titled "Monthly reachability refresh (only run on the 1st of the month)" and
+its body says "Skip this step unless today is the 1st" and instructs
+re-researching the routes "the same way `scripts/seed-reach.ts`'s original
+pass did" — i.e. it currently documents both the monthly cadence *and* the
+full-rebuild-from-scratch approach this step just replaced with a diff. This
+step's touches list is `src/mcp/server.ts`, `src/db/queries.ts`,
+`data/routes.json` only, so I did not edit `SCHEDULED_TASK.md` even though
+the task description explicitly told me to check it for cadence language.
+Flagging loudly: whoever picks up `SCHEDULED_TASK.md` next (S5.6, "The
+skill," looks like the natural place — it touches `SCHEDULED_TASK.md`
+directly) should change §4's title/skip-condition to quarterly (e.g. "only
+run in the last week of March or October") and rewrite its body to call
+`get_current_routes` per origin first and submit only changed/removed rows
+to `refresh_reachability`, instead of re-deriving everything.
+
+**Assumed.**
+- `origin_iata` on `get_current_routes` is optional rather than required —
+  the plan says "support filtering," not "require filtering." Omitting it
+  returns every row (up to 864 in production), which the tool description
+  calls out as "a lot" so the model isn't surprised; the intended usage
+  pattern (per plan and per `SCHEDULED_TASK.md`'s "one airport per turn"
+  framing) is still to always pass it.
+- Deletion is keyed the same way upserts already are: `{city_key,
+  origin_iata}` for `reachability`, `iata` for `origins`. No cascade from
+  `remove_origins` to that origin's `reachability` rows (documented inline in
+  `deleteOrigin`'s doc comment) — matches every other table in this repo
+  (no `ON DELETE CASCADE` anywhere in `migrations/`), and an origin
+  disappearing entirely is a rare enough event that requiring both lists
+  explicitly seemed safer than guessing the caller wants a cascade.
+- Left `refresh_reachability`'s response shape additive (added
+  `reachability_removed`/`origins_removed` counts alongside the existing
+  `origins_upserted`/`reachability_upserted`) rather than restructuring it,
+  since nothing else in this repo consumes that JSON programmatically today
+  (it's a Claude-run's own tool result, read by a model, not parsed by other
+  code).
+
+**Left undone.**
+- `SCHEDULED_TASK.md` §4 cadence/approach text — see "Also surfaced" above.
+- Structured `airline`/`frequency` columns on `reachability` — see "A real
+  gap" above; would need a migration.
+- No change to `DESIGN.md` §7's "refreshed monthly by a Claude run" line —
+  same touches-list reasoning; flagging here since it's now inconsistent
+  with the tool description until someone with design-doc scope updates it.
+
+**Verification performed.**
+```
+npx tsc --noEmit -p tsconfig.json     # clean, whole project
+
+# node:sqlite fixture harness (same approach as S4.7/S5.3's precedent),
+# calling src/db/queries.ts's real functions directly against an in-memory
+# SQLite db built from the reachability/origins CREATE TABLE statements in
+# migrations/0001_init_schema.sql -- these functions are exactly what the two
+# MCP tool handlers call, so this exercises the same code path the tool
+# wiring uses. Harness lives only in the session scratchpad
+# (d1-shim.ts, harness.ts), not the repo.
+
+PASS  get_current_routes CLJ returns exactly 2 rows
+PASS  get_current_routes CLJ rows are both origin_iata=CLJ
+PASS  get_current_routes CLJ excludes the BUD row
+PASS  get_current_routes BUD returns exactly 1 row
+PASS  get_current_routes with no origin returns all 3 rows
+PASS  after refresh: CLJ still has exactly 2 rows (1 updated + 1 new, 1 removed)
+PASS  leeds row was updated to tier B
+PASS  berlin row was newly inserted with tier A
+PASS  milan row is gone (discontinued route deleted, not just omitted)
+PASS  BUD row untouched by a CLJ-only refresh
+PASS  remove_origins deletes the origin row
+PASS  origin delete does not cascade-delete its reachability rows
+
+12 passed, 0 failed
+
+# Also confirmed against the real local D1 (unmodified by this step -- no
+# migration, so its 864 rows from S1.2 are untouched):
+npx wrangler d1 execute concert-watch --local --command "SELECT COUNT(*) FROM reachability;"   # 864
+```
+
+**Proposed commit message.**
+```
+Make reachability refresh a diff, move cadence to quarterly (S5.5)
+
+Adds get_current_routes(origin_iata?) to the scheduled-task MCP
+surface, reading D1's reachability table (getReachabilityByOrigin,
+src/db/queries.ts) so a refresh can check what's already stored
+instead of re-researching all ~477 routes from scratch. Extends
+refresh_reachability with remove_reachability/remove_origins so a
+discontinued route can actually be deleted, not just omitted --
+previously omission and removal were indistinguishable. origins/
+reachability request fields are now both optional (submit only what
+changed). Cadence language (tool description, file header comment)
+moves from monthly to quarterly, per the IATA seasonal-boundary
+reasoning in DESIGN.md's neighborhood. data/routes.json is untouched
+data-wise (its $schema_note now says explicitly why: it's one-time
+seed data for scripts/seed-reach.ts, never read by the MCP server or
+written by refresh_reachability, which persists straight to D1).
+SCHEDULED_TASK.md §4 still documents the old monthly/full-rebuild
+routine -- flagged in PROGRESS.md as follow-up for whoever picks up
+S5.6.
+```
+
+## S5.2 — Bulk add and raised caps
+
+**Built.**
+- `src/agent/tools.ts` -- new `add_artists(bands)` tool: takes a list of
+  `{ name, priority? }`, resolves and acquires each in sequence, and returns
+  one compact result grouped into `resolved` / `ambiguous` / `not_found`.
+  One tool call regardless of list length, closing the gap the step names:
+  onboarding a 25-band email through `add_artist` one call per band would
+  have spent 25 of `MAX_TOOL_CALLS_PER_SESSION` on its own.
+  - The per-band resolve-insert-watchlist-acquire pipeline that used to live
+    directly in `handleAddArtist` was pulled out unchanged into
+    `resolveAndAddOneArtist(name, priority, ctx)`. `handleAddArtist` is now a
+    two-line wrapper around it; `handleAddArtists` calls it once per band in
+    a plain sequential `for` loop (not `Promise.all`) and sorts each
+    outcome into the right bucket. Existing `add_artist` behaviour,
+    including its `AddArtistOutput` shape, is untouched.
+  - `resolved` entries carry the same `acquisition` summary (tour count,
+    date count, nearest reachable date) `add_artist` already returns per
+    S5.1, plus `input_name` so a reply can match a result back to what the
+    subscriber typed (useful when resolution renames e.g. "Idles" to
+    "IDLES").
+  - `ambiguous` entries carry the same short candidate list plus
+    did-you-mean question `add_artist` returns, plus `input_name`.
+  - `not_found` is **not** produced by `resolveArtist` itself -- reading it,
+    there is no "no match at all" outcome; an artist with zero MusicBrainz
+    candidates still resolves successfully with `coverage: 'dark'` (S3.1's
+    own documented behaviour, not something this step changes). `not_found`
+    in `add_artists` instead catches a real thrown error from any point in
+    one band's pipeline (a MusicBrainz/Ticketmaster/Anthropic fetch
+    failure, a D1 write failure, etc.) so one flaky band can't take down the
+    other 24 -- each band's `resolveAndAddOneArtist` call is individually
+    try/caught, and the error's message becomes `reason`. This is a
+    judgment call: the task's wording ("not-found") reads as if it should
+    be a distinct resolution outcome, but no such outcome exists anywhere
+    in the resolution pipeline to plumb through, so `not_found` was given
+    the closest meaningful job instead (surfacing a failure without losing
+    the rest of the batch) rather than being left dead code that can never
+    fire.
+  - Tool description and every schema field description were written to
+    Rule 5 from the start (no internal names, no step numbers) rather than
+    written first and fixed in the later S5.4 cleanup pass, since this is a
+    brand new tool with nothing to carry forward from an old description.
+  - `AGENT_TOOLS` gained `addArtistsTool` (after `addArtistTool`). Because
+    S5.3 (already built, see its own entry above) registers every entry of
+    `AGENT_TOOLS` generically onto the subscriber MCP server, `add_artists`
+    is now automatically exposed over MCP too, satisfying that step's own
+    forward-reference ("Expose add_artists too once S5.2 lands") for free --
+    **except** see the flagged gap below about the array-typed `bands`
+    field.
+- `src/model/client.ts` -- `MAX_TOOL_CALLS_PER_SESSION` raised from 8 to 20,
+  per the task's instruction (an anti-runaway guess, not a cost control;
+  `MAX_INPUT_TOKENS_PER_SESSION` is unchanged and remains the real ceiling).
+- `src/mail/conversation.ts` -- `MAX_CONVERSATION_TURNS` raised from 12 to
+  25, which the task calls "the actual bug in this step": at 12, this
+  belt-and-braces turn limit would end the conversation before the model
+  could ever spend all 20 tool calls one-per-turn, so raising the tool-call
+  cap alone would have changed nothing observable. Also added one sentence
+  to the system prompt telling the model to prefer `add_artists` over
+  repeated `add_artist` calls when the subscriber lists several bands at
+  once -- belt-and-braces on top of `add_artists`'s own tool description,
+  since the system prompt is the one place that compares tools against each
+  other rather than describing one in isolation.
+
+**Verified (fixture harness, since no live API keys are available here).**
+Built an ad-hoc harness -- not committed, lives only in this session's
+scratchpad, per the task's "touches ONLY" list leaving no room for a new
+test file in the repo -- that:
+- Spins up a real in-memory SQLite database via Node's `node:sqlite`
+  (`DatabaseSync`, run under `node --experimental-sqlite`), applies all six
+  migration files verbatim, and wraps it in a ~30-line `D1Database` shim
+  (`prepare().bind().first()/.all()/.run()`, `RETURNING id` supported)
+  rather than mocking `db/queries.ts` itself -- this exercises the real SQL
+  every query function runs, not a hand-simulated approximation of it.
+- Fakes only the network edges: `musicbrainzLookup` (per S5.1/S3.1's own
+  injectable-for-tests seam) and a single dispatching `fetchImpl` covering
+  the Anthropic resolve call, the Ticketmaster attraction-search endpoint,
+  and the Ticketmaster event-search endpoint. No tour-page fetch fixture
+  was built (would need a fake JSON-LD HTML page plus `checkTourPage`
+  plumbing) -- the resolve fixture never gives the model a confident
+  `tour_url`, so that branch of `pollOneArtist` legitimately never fires,
+  same as it would for most real bands (the model is explicitly told not to
+  guess a tour URL).
+- Ran one `add_artists` call for a 25-band fixture list with mixed
+  priorities and mixed outcomes by design: 15 cleanly resolved with no
+  tour data, 6 resolved with a fake 2-date Ticketmaster tour (exercising
+  `persistRawEvent` -> `clusterToursForArtist` -> `attachReachabilityToTour`
+  end to end), 3 genuinely ambiguous (two same-named MusicBrainz
+  candidates), 1 with no MusicBrainz match at all (still resolves,
+  `coverage: 'dark'`), and 1 simulating a real fetch failure.
+- Result: `resolved: 21, ambiguous: 3, not_found: 1` -- every one of the 25
+  input bands accounted for, the 6 tour-bearing bands each came back with
+  `tour_count: 1, date_count: 2` and a `nearest_reachable_date`, and the
+  whole batch was driven by exactly one `add_artists` call (never a loop of
+  25 `add_artist` calls) as intended. `npx tsc --noEmit -p tsconfig.json`
+  passes clean.
+
+**Wall-clock estimate for 25 bands (reasoning, not a live-timed run).**
+Per band, sequentially (bands are not processed concurrently -- see the
+concurrency note in `add_artists`'s own doc comment in `tools.ts`):
+- MusicBrainz lookup: hard-throttled to 1 req/s, **module-scoped across the
+  whole process** (`src/sources/musicbrainz.ts`'s `throttle()`), so this is
+  the dominant, unavoidable serial cost -- roughly 1-1.5s per band including
+  the request itself once the throttle is warmed up (worse on a 429, which
+  backs off 1s then 2s -- not modelled below, treated as a variance risk).
+- The Anthropic resolve call (`askModelToResolve`, Haiku, forced tool use,
+  small prompt) -- a real network round trip, estimated 1-2s, skipped only
+  for the rare zero-MusicBrainz-candidate ("dark") band.
+- Ticketmaster: an attraction lookup (skipped if `resolveArtist` already
+  found one) plus one events-page fetch inside `acquireArtist`, estimated
+  0.5-1s combined; Ticketmaster's own throttle (5 req/s) never binds here
+  since a fresh `TicketmasterAdapter` is constructed per band in
+  `handleAddArtist`/`resolveAndAddOneArtist` and one band makes at most a
+  couple of calls to it.
+- Tour page fetch: only for bands where the model returned a confident
+  `tour_url` -- assumed a minority in practice (the model is told not to
+  guess), estimated 0.5-1.5s when it does fire, averaged down for bands
+  that skip it entirely.
+- Rough total: **~4s/band**, so **~100s (roughly 1.5-2 minutes) for 25
+  bands**, dominated almost entirely by waiting on external HTTP responses,
+  not by CPU-bound work in the Worker itself (JSON parsing, SQL execution,
+  SHA-1 fingerprinting -- all fast, all together plausibly well under 1s of
+  actual CPU time across the whole batch).
+
+Checked against Cloudflare's own limits (`developers.cloudflare.com/workers/
+platform/limits/`, fetched live this session, not assumed from training
+data): on the paid plan, **CPU time defaults to 30s and can be raised to 5
+minutes (300,000ms)**, and critically **"waiting on network requests (such
+as fetch() calls, KV reads, or database queries) does not count toward CPU
+time."** Wall-clock duration has **no hard limit for HTTP-triggered
+Workers on the paid plan** ("As long as the client remains connected, the
+Worker can continue processing"). Cloudflare's limits page does not carry a
+separate table for the `email()` handler specifically -- **assumed** (not
+independently reconfirmed against an email-handler-specific limits page) to
+follow the same CPU-time/no-hard-wall-clock model as other Worker
+invocation types, since Email Workers run on the same Workers runtime
+rather than a distinct execution engine.
+
+**Conclusion: 25 bands should fit inside one request/response cycle.** The
+~100s estimated wall-clock is almost entirely I/O wait, which this
+platform's docs say does not consume the CPU budget and is not subject to
+a hard wall-clock cap on the paid plan; the actual CPU-bound work for 25
+bands is small. The dominant risk to this estimate is MusicBrainz 429
+backoff pushing individual bands' throttle waits higher, which would slow
+the batch further but, per the same "no hard wall-clock limit" reasoning,
+would not by itself cause the request to be cut off -- it would just take
+longer. This was not verified with a live timed run (no API keys in this
+environment); if this estimate needs firming up before relying on it in
+production, the natural next step is a real 25-band run against live
+MusicBrainz/Ticketmaster/Anthropic and a stopwatch, not a bigger fixture
+harness.
+
+**Assumed / judgment calls.**
+- Bands in `add_artists` are processed **sequentially**, not concurrently.
+  MusicBrainz's throttle is process-global regardless of call concurrency,
+  so parallelising would not speed up the dominant cost, and sequential
+  processing avoids any question of concurrent D1 writes to the same
+  subscriber's watchlist rows from overlapping `resolveAndAddOneArtist`
+  calls. Documented in `handleAddArtists`'s doc comment, not left implicit.
+- No artificial cap was placed on how many bands one `add_artists` call can
+  list (beyond `minItems: 1` in the schema, mirroring `add_artist`'s own
+  lack of a cap on anything). The task explicitly says not to silently
+  truncate the list in code if the analysis suggests it won't fit -- the
+  analysis above says 25 *does* fit, so there was nothing to truncate for;
+  a subscriber onboarding an absurdly long list (hundreds of bands) is not
+  addressed here and would be slower still, but that's a different, much
+  larger number than the one this step was asked to make work.
+- `not_found`'s meaning (a genuine per-band failure, not a resolution
+  outcome) is a judgment call -- see the **Built** section above for the
+  full reasoning; flagging it again here since it's the one place this
+  step's own wording and the actual shape of `resolveArtist`'s contract
+  don't quite line up.
+
+**Left undone / flagged gaps.**
+- **`buildSubscriberMcpServer`'s JSON-Schema-to-Zod converter
+  (`agentInputSchemaToZodShape` in `src/mcp/server.ts`, built in S5.3) does
+  not understand `type: 'array'`.** It falls through to its `else` branch
+  and treats `add_artists`'s `bands` field as a plain `z.string()`. Since
+  `mcp/server.ts` is outside this step's touch list ("Touches ONLY:
+  `src/agent/tools.ts`, `src/model/client.ts`, `src/mail/conversation.ts`.
+  If you need to touch anything else, stop and write why in PROGRESS.md
+  instead" -- this is that stop-and-write), this was not fixed here. Net
+  effect: `add_artists` works correctly through the email reply path
+  (`src/mail/conversation.ts`, which reads tool schemas straight from
+  `AGENT_TOOLS`/`agentToolDefinitions()`, never through the Zod converter)
+  but would currently reject or mis-handle a `bands` argument if called
+  through the subscriber MCP endpoint. This needs a follow-up in
+  `mcp/server.ts` -- teaching `agentInputSchemaToZodShape` to build
+  `z.array(z.object(...))` for an `items: { type: 'object', properties }`
+  schema -- before `add_artists` can be trusted over MCP. `add_artist`
+  (singular) is unaffected; it has no array-typed field.
+- No live network call was made against real MusicBrainz/Ticketmaster/
+  Anthropic endpoints (no API keys in this environment, consistent with
+  this codebase's standing precedent for verification steps) -- the
+  fixture harness above stands in, per the task's own suggestion to do so.
+- The wall-clock estimate is reasoning from known per-call costs and
+  Cloudflare's documented limits, not a measured number -- flagged
+  explicitly above rather than presented as a timed result.
+
+**Proposed commit message.**
+```
+Add add_artists bulk-onboarding tool, raise tool-call/turn caps (S5.2)
+
+New add_artists(bands) in src/agent/tools.ts resolves and acquires a
+whole list of bands in one tool call (grouped resolved/ambiguous/
+not_found), so a 25-band onboarding email no longer spends one of
+MAX_TOOL_CALLS_PER_SESSION per band. Extracted the existing add_artist
+pipeline into resolveAndAddOneArtist so both tools share it unchanged.
+MAX_TOOL_CALLS_PER_SESSION: 8 -> 20 (client.ts). MAX_CONVERSATION_TURNS:
+12 -> 25 (conversation.ts) -- the actual bug this step names: at 12,
+the turn limit would end a conversation before 20 tool calls could
+ever fire. MAX_INPUT_TOKENS_PER_SESSION left at 40k. Verified against
+a from-scratch fixture harness (real in-memory SQLite via node:sqlite,
+faked network edges only) rather than live APIs; wall-clock estimate
+for 25 bands (~100s, I/O-bound) and Cloudflare Workers CPU/duration
+limits recorded in PROGRESS.md.
+```
+
+## S5.4 — Tool descriptions rewritten for their actual reader
+
+**Built.**
+- Reworded every `description` string (tool-level and input-schema-field-
+  level) in `src/mcp/server.ts` and `src/agent/tools.ts` that cited a step
+  number, a `DESIGN.md`/`IMPLEMENTATION_PLAN.md` section, a file path, an
+  internal function name, or an internal table/column name. These are the
+  strings the model actually reads at call time (via `tools[].description`
+  and each JSON-Schema property's `description`) -- they went out as
+  "S4.1's buildDigestPayload", "DESIGN.md §10's...", "src/sources/
+  tourpage.ts's needs_model_parse result", "queued in `pending_page_parses`
+  -- migrations/0003", etc., none of which means anything to a model that
+  has never seen this repository. Nine tool-level descriptions changed in
+  `server.ts` (`get_pending_digest`, `submit_digest`, `get_sweep_targets`,
+  `submit_sweep_results`, `get_unparsed_pages`, `submit_parsed_events`,
+  `get_current_routes`, `refresh_reachability` -- `status` and
+  `mint_subscriber_token` were already clean, from S5.5 and S5.3
+  respectively) plus three in `tools.ts` (`set_priority`,
+  `get_reachability`, `save_preference` -- the other seven agent tools were
+  already clean; `add_artist`/`add_artists` were written self-contained
+  when S5.1/S5.2 added them, per those steps' own PROGRESS.md notes).
+  `get_pending_digest`'s new text matches the plan's own worked example
+  near verbatim: "Returns the concerts waiting to be told to one
+  subscriber, grouped by tour with travel options attached. Returns
+  { send: false } when nothing is waiting -- that's normal and common;
+  most days there's nothing." Every rewrite kept the same three things the
+  plan asked for: what the tool does, when to reach for it, and what a
+  normal (including a normal-empty) result looks like -- e.g.
+  `get_sweep_targets`'s new text explains that the same artist list can
+  legitimately come back day after day, and `refresh_reachability`'s
+  explains that omitting a row means "unchanged", never "removed", so the
+  model doesn't misread silence as a deletion.
+  No input-schema *field* descriptions needed rewriting -- read all of them
+  in both files; the existing ones (`origin_iata`, `city_key`, `bands`,
+  etc.) were already self-contained plain-English descriptions with no
+  internal references.
+  Left untouched, correctly: code comments (`//`, `/** */`) and the two
+  files' own header/section comments. The task's own wording ("every
+  description a model reads at runtime") and the done-when ("no
+  runtime-visible string") both scope this to `description` values, which
+  is the only text either the Anthropic Messages API or an MCP client ever
+  actually sends to a model -- a `// S5.3:` comment two lines above a
+  handler is never serialised into any tool schema or prompt. Rewriting
+  every comment in both files too would have been a much larger diff for
+  no runtime effect, and would have made the "why" documentation harder to
+  audit against `IMPLEMENTATION_PLAN.md`/`PROGRESS.md` for the next person
+  who opens these files as source, not as a model. So comments were left
+  exactly as prior steps wrote them.
+- Fixed the flagged JSON-Schema-to-Zod bug: `agentInputSchemaToZodShape` in
+  `src/mcp/server.ts` (added in S5.3) only handled scalar leaf types
+  (string/integer/number/boolean/enum) -- any property with `type:
+  'array'` fell through its `if`/`else if` chain to the plain-string
+  default, so `add_artists`'s `bands` field (a `type: 'array'` of
+  `{ name, priority? }` objects, added in S5.2) would have been coerced to
+  `z.string()` and rejected every real call made through a subscriber's
+  MCP token. S5.2's own PROGRESS.md entry had already flagged this exact
+  gap in advance ("`add_artists` is not yet safely callable through
+  ... `mcp/server.ts` -- teaching `agentInputSchemaToZodShape` to build
+  `z.array(z.object(...))`..."). Fixed by splitting the per-property logic
+  out into a new `jsonSchemaPropertyToZod(prop)` that recurses: an `array`
+  property converts to `z.array(jsonSchemaPropertyToZod(items))` and an
+  `object` property (used for array items, e.g. `bands`'s
+  `{ name, priority }` element schema) converts via a recursive call back
+  into `agentInputSchemaToZodShape`. `agentInputSchemaToZodShape` itself is
+  now just the top-level "build a shape, apply `required`" loop, calling
+  the new function per property -- same public signature, same behaviour
+  for every pre-existing scalar/enum field, `array`/nested-`object` now
+  handled instead of silently miscast.
+  Verified directly (not just by reading): a throwaway script imported
+  `AGENT_TOOLS`, ran `add_artists`'s real `input_schema` through the fixed
+  converter, and confirmed `{ bands: [{ name: 'Radiohead', priority: 'P1'
+  }, { name: 'Boards of Canada' }] }` parses successfully while
+  `{ bands: 'not-an-array' }` is correctly rejected -- proving the fix
+  against the tool's actual current schema shape, not a hand-built stand-in.
+  Deleted the script afterward (not in this step's touch list; `git
+  status` confirms nothing new was left behind).
+
+**Assumed / judgment calls.**
+- Interpreted "no runtime-visible string" as scoped to `description`
+  fields specifically (tool-level `description` and JSON-Schema property
+  `description`), not every string literal in either file -- e.g. the
+  literal `reason: 'no_pending_notifications'` value `submit_digest`
+  returns is runtime-visible in the sense that a model reads the tool
+  *result*, but it isn't a *description* a model reads to decide whether
+  or how to call the tool, and it's already a self-explanatory
+  machine-readable enum value, not prose citing an internal source. Left
+  those alone.
+- `D1` (Cloudflare's database product name) was treated as acceptable to
+  keep in `get_current_routes`'s prior wording ("stored in D1") only
+  provisionally -- on reflection it's still an implementation detail
+  nobody outside this codebase would recognise, so it was dropped in
+  favour of "currently on file" in the actual rewrite rather than kept.
+  Noting the judgment call explicitly since D1 isn't a step number, file
+  path, or function name and so falls in a grey area the done-when
+  criteria don't literally name.
+- Model names (e.g. "Sonnet" in `escalate`'s description) were kept --
+  unlike a step number or file path, "the more capable model" plus its
+  actual name is information a reader with zero repository knowledge can
+  still use correctly, and the description already leads with the
+  plain-English framing.
+
+**Left undone.**
+- Did not touch `data/routes.json`, `SCHEDULED_TASK.md`, or any other file
+  -- this step's touch list is exactly `src/mcp/server.ts`,
+  `src/agent/tools.ts`, and nothing needed touching outside them, so
+  nothing else was.
+- `npx tsc --noEmit -p tsconfig.json` passes with no errors. `npx prettier
+  --check` initially flagged `src/mcp/server.ts` (line-wrapping only, from
+  the longer rewritten description strings); ran `npx prettier --write`
+  on it and re-verified clean formatting plus a clean `tsc` pass
+  afterward.
+
+**Proposed commit message.**
+```
+Rewrite tool/schema descriptions for a reader with no repo context (S5.4)
+
+Every tool-level and input-schema-field `description` string in
+src/mcp/server.ts and src/agent/tools.ts that cited a step number, a
+DESIGN.md/IMPLEMENTATION_PLAN.md section, a file path, or an internal
+function/table name has been reworded to state plainly what the tool
+does, when to use it, and what a normal (including normal-empty)
+result looks like -- the three things a model reading these at call
+time actually needs, per the plan's own get_pending_digest example.
+Nine descriptions changed in server.ts, three in tools.ts; the rest
+were already self-contained. Also fixes a bug S5.2 had already
+flagged in advance: agentInputSchemaToZodShape (server.ts) had no
+case for `type: 'array'` properties, so add_artists's `bands` array
+field would silently coerce to z.string() and reject every real call
+made through a subscriber's MCP token. Split the per-property
+conversion into a new jsonSchemaPropertyToZod that recurses for
+`array`/`object`, verified against add_artists's actual input_schema
+with a throwaway script (parses a real bands array, rejects a
+non-array) before deleting it.
+```
+
+## S5.6 — The skill
+
+**Built.**
+- `SKILL.md` (new, repo root) — the single versioned prompt. Frontmatter
+  names it `concert-watch`, invoked as `/concert-watch`, with an optional
+  `recipient="Name"` argument, and its `description` states plainly that
+  this same text is also what the daily scheduled task runs (pointing at
+  `SCHEDULED_TASK.md` for that wiring) -- exactly the "one prompt, two
+  triggers" shape the step asked for. The body opens by naming both ways it
+  might have been triggered (an automatic daily run, or a manual
+  `/concert-watch`) and states the routine is identical either way except
+  for how `recipient` scopes step 3.
+  The six steps: (1) dark-artist sweep via `get_sweep_targets` /
+  `submit_sweep_results`, (2) unparsed tour pages via `get_unparsed_pages` /
+  `submit_parsed_events`, (3) compose-and-send digests via
+  `get_pending_digest` / `submit_digest` -- scoped to one subscriber when
+  `recipient` matches, to everyone-with-something-pending otherwise -- (4) a
+  quarterly reachability-refresh branch, gated on "explicitly asked" or "a
+  season boundary has passed since the data on file was last touched", using
+  `get_current_routes` per origin to diff against before calling
+  `refresh_reachability` with only what changed plus explicit removals
+  (matching S5.5's new diff/removal tool shape, not the old full-rebuild
+  approach S5.5's own entry flagged as stale here), (5) new-artist
+  resolution if explicitly asked, and (6) a closing `status` call. Every
+  tool is referred to by its actual registered name (`get_sweep_targets`,
+  `submit_digest`, etc.) rather than described-but-unnamed, on the judgment
+  that the model needs the literal callable name to pick the right tool
+  unambiguously among several similarly-worded ones (e.g.
+  `submit_sweep_results` vs `submit_parsed_events`) -- tool names are the
+  model-facing API surface those S5.4-rewritten descriptions are already
+  keyed by, not internal-only jargon, so naming them isn't a rule-5
+  violation the way a step number or file path would be.
+  Step 3 states the digest's required voice directly and prominently ("Write
+  like a festival lineup curator personally excited to tell a friend what's
+  coming, not like a status report or a system notification"), per the
+  step's own instruction that this belongs in the prompt text, not in
+  `src/digest/render.ts` -- flagged with bold text and "read it twice"
+  framing so it doesn't get skimmed past the way a single sentence buried in
+  a longer list might. Digest content/format rules (one block per tour,
+  three most-reachable dates, tour handle, per-tour follow-up invitation,
+  standing footer, tables/inline-CSS-only, ~100 KB cap) are restated in
+  plain language with zero `DESIGN.md` citations, unlike the prior
+  `SCHEDULED_TASK.md` text this replaces, which still had two literal
+  `(DESIGN.md §10...)` citations left in from S4.9's original draft.
+- `SCHEDULED_TASK.md` (existing, rewritten) — no longer contains a second
+  copy of the routine. It now says explicitly that `SKILL.md`'s body *is*
+  the prompt, instructs pasting that text (plus one short framing line
+  giving the automatic trigger its "no recipient, run for everyone" context)
+  into the Claude app's scheduled task, and warns against editing the copy
+  in the app directly since that's exactly how the two would drift. Cadence
+  is quarterly throughout; the old "Monthly reachability refresh (only run
+  on the 1st of the month)" section and its instruction to re-derive the
+  whole ~477-route table from scratch every time are gone entirely -- S5.5's
+  own entry had flagged this exact leftover text as follow-up for whoever
+  picked up this step. Endpoint, `MCP_AUTH_TOKEN`, cron timing, and the
+  36-hour-fallback explanation are kept, trimmed of the routine content that
+  moved to `SKILL.md`.
+
+**Assumed / judgment calls.**
+- **The subscriber roster is a short hand-maintained list inside `SKILL.md`
+  itself (currently just `id 1 -- Rareș`), not something derived from a
+  tool.** Investigated first: there is no MCP tool on the scheduled-task
+  surface (`buildMcpServer`, `src/mcp/server.ts`) that lists subscribers or
+  their ids/names -- `status()` returns only a global pending-notification
+  *count*, never broken out per subscriber, and `get_pending_digest` takes a
+  `subscriber_id` it must already be given rather than discovering one.
+  `getAllSubscribers` exists in `src/db/queries.ts` but nothing in
+  `server.ts` calls it or exposes it as a tool. Probing sequential ids
+  against `get_pending_digest` doesn't work either: a nonexistent id and a
+  real subscriber with nothing pending both come back as
+  `{ send: false, reason: 'no_pending_notifications' }` (`buildDigestPayload`,
+  `src/digest/payload.ts`, checks pending notifications before checking
+  whether the subscriber row even exists) -- so there is no reliable way to
+  tell "no such subscriber" apart from "this subscriber, nothing new" using
+  only the tools this step is allowed to touch. Given the touches list is
+  `SKILL.md`/`SCHEDULED_TASK.md` only (no `server.ts`, no new
+  `list_subscribers` tool), a hand-maintained roster is the only way
+  `recipient=` name-matching or a no-argument "everyone with something
+  pending" loop can work at all today -- consistent with this same
+  document's own established pattern of embedding small, stable,
+  hand-maintained configuration directly in prompt text (the six-airport
+  list this file already carried unchanged). Only listed Rareș
+  (`raresp98@gmail.com` per the confirmed manual `INSERT INTO subscribers`
+  recorded in this file's own S1.x-era entry) with real confidence --
+  deliberately did not invent a Paula row: the plan's own "Manual steps for
+  Rareș" list still has "Send the invites" scheduled *after* S6.3, which
+  hasn't happened yet, so there may currently be no second subscriber row in
+  the real database at all, and writing one into a runtime prompt on a guess
+  would be actively wrong. **This is a real gap, surfaced rather than
+  silently patched around**: a `list_subscribers`-shaped admin tool on
+  `server.ts` would close it properly; flagging it here since it's outside
+  this step's touch list.
+- **Season-boundary staleness check is instructed as "read the most recent
+  `computed_at` across `get_current_routes()`'s full result and compare to
+  the nearest March/October boundary,"** not a literal date-arithmetic
+  formula, since a prompt is read by a model that can reason about dates
+  fine in prose and a rigid formula risked being wrong at edge cases (e.g.
+  very early January) in a way that's harder to notice than a model just
+  reasoning it through. Told it to err toward *not* refreshing when unsure,
+  since an unnecessary refresh is a large wasted research task while a
+  slightly-late one is caught the next quarter.
+- **Step 5 (new-artist resolution) is written as "work out the answer and
+  report it, since nothing on this tool surface can save it"** rather than
+  naming a save-capable tool, because there genuinely isn't one: `add_artist`
+  /`add_artists` exist only on the subscriber-scoped MCP surface
+  (`buildSubscriberMcpServer`), gated by that one subscriber's own private
+  token, and this routine only ever holds the admin token
+  (`buildMcpServer`). This mirrors what the original `SCHEDULED_TASK.md`
+  §5 already left soft/unresolved -- not a gap this step introduced, but
+  worth restating plainly rather than implying a tool exists that doesn't.
+- Kept `recipient=` scoping to step 3 only (digest composition), running
+  steps 1/2/4 in full regardless of a given recipient, on the reading that
+  "runs it for her alone" describes the *outcome* (only she gets a digest
+  out of this run) rather than an instruction to skip the shared research
+  steps that might be exactly what puts something new in her digest in the
+  first place.
+
+**Left undone.**
+- No `list_subscribers`/`get_subscribers` admin MCP tool -- see the roster
+  judgment call above; would need `src/mcp/server.ts` (outside this step's
+  touches).
+- Did not touch `IMPLEMENTATION_PLAN.md`'s "Manual steps for Rareș" line
+  ("Its prompt is `SCHEDULED_TASK.md` — paste from there") even though
+  after this step the more precise statement is "the prompt is `SKILL.md`'s
+  body, pasted via `SCHEDULED_TASK.md`'s instructions" -- outside this
+  step's touch list (`SKILL.md`, `SCHEDULED_TASK.md` only).
+  `SCHEDULED_TASK.md` itself now says this correctly; only the plan's own
+  cross-reference is now slightly imprecise.
+- Not run end-to-end against a live Claude scheduled task or a seeded D1
+  instance in this pass -- per the step's own "Done when," verified by
+  careful read-through instead: every tool `SKILL.md` calls by name
+  (`get_sweep_targets`, `submit_sweep_results`, `get_unparsed_pages`,
+  `submit_parsed_events`, `get_pending_digest`, `submit_digest`,
+  `get_current_routes`, `refresh_reachability`, `status`) exists on the
+  scheduled-task MCP surface with a matching S5.4-rewritten description,
+  confirmed by reading `src/mcp/server.ts` directly rather than from memory.
+
+**Proposed commit message.**
+```
+Write the concert-watch skill: one prompt for cron and /concert-watch (S5.6)
+
+New SKILL.md is the single versioned prompt for the daily research-
+and-composition routine, invoked either automatically or by hand as
+/concert-watch with an optional recipient="Name" argument that scopes
+digest composition to one subscriber. Six steps: dark-artist sweep,
+unparsed-tour-page parsing, compose-and-send digests (with the
+"festival lineup curator, not a status report" voice instruction
+stated directly in the prompt per the step's own reasoning for
+keeping it out of render.ts), a quarterly reachability-refresh branch
+that diffs against get_current_routes instead of rebuilding from
+scratch (matching S5.5's new tool shape), optional new-artist
+resolution, and a closing status() summary. SCHEDULED_TASK.md no
+longer duplicates the routine -- it points at SKILL.md's body as the
+one copy to paste into the Claude app, and drops the stale
+monthly/full-rebuild reachability section S5.5's own entry had
+flagged as left over. Surfaced a real gap rather than working around
+it silently: there is no MCP tool that lists subscribers, so
+recipient= matching and the no-argument "everyone with something
+pending" loop both depend on a small hand-maintained roster inside
+SKILL.md (currently just Rareș, since Paula's invite per the plan's
+own manual-steps list hasn't gone out yet) until a future step adds
+one.
+```

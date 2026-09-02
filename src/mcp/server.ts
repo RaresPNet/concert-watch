@@ -3,7 +3,7 @@
  * a Claude scheduled task talks to over MCP to do every piece of
  * scheduled/autonomous work on app quota rather than a billed API key: the
  * daily digest, the `dark`-artist search sweep, tour-page parsing when no
- * JSON-LD is present, the monthly reachability refresh, and (implicitly,
+ * JSON-LD is present, the quarterly reachability refresh, and (implicitly,
  * via `submit_sweep_results`/`submit_parsed_events`) the events an add-time
  * or sweep-time resolution pass finds. Nothing in this file ever calls the
  * Anthropic API itself -- it is the *target* MCP tools are called against,
@@ -50,15 +50,20 @@ import { z } from 'zod';
 
 import {
 	countPendingNotifications,
+	deleteOrigin,
 	deletePendingPageParse,
+	deleteReachability,
 	getAllPendingPageParses,
 	getAllSourceHealth,
 	getArtistById,
 	getDarkArtists,
 	getPendingNotificationsForSubscriber,
+	getReachabilityByOrigin,
+	getSubscriberByMcpToken,
 	getSubscriberById,
 	getTotalSpend,
 	markNotificationSent,
+	setSubscriberMcpToken,
 	touchArtistActivity,
 	touchArtistPolled,
 	upsertOrigin,
@@ -70,6 +75,7 @@ import { CloudflareMailer } from '../mail/cloudflare';
 import { persistRawEvent, type PollEventOutcome } from '../core/poll';
 import { getBudgetStatus } from '../model/budget';
 import type { RawSourceEvent } from '../sources/types';
+import { AGENT_TOOLS, callAgentTool, createWebSearchState, type AgentToolContext } from '../agent/tools';
 
 // ---------------------------------------------------------------------------
 // Env slice this file needs. Deliberately narrower than the generated `Env`
@@ -89,6 +95,16 @@ export interface McpEnv {
 	MODEL_MONTHLY_CEILING_USD?: string;
 	/** Overrides the default `From` address for `submit_digest`'s send. */
 	DIGEST_FROM_ADDRESS?: string;
+	/**
+	 * S5.3: the same two secrets `src/index.ts`'s `/__test-resolve` route
+	 * already reads off `env as any` for `resolveArtist`. The subscriber-
+	 * scoped agent tools (`add_artist` via `resolveArtist`, `web_search`) need
+	 * both to do real work; without them those two tools fail at call time
+	 * rather than at startup, same as every other place this repo threads an
+	 * unset secret through.
+	 */
+	ANTHROPIC_API_KEY?: string;
+	TICKETMASTER_API_KEY?: string;
 }
 
 const DEFAULT_FROM_ADDRESS = 'concert-watch@raresp.net'; // the domain S1.3 already verified a real send against
@@ -197,9 +213,8 @@ export function buildMcpServer(db: D1Database, env: McpEnv): McpServer {
 		'get_pending_digest',
 		{
 			description:
-				"The structured digest payload for one subscriber (S4.1's buildDigestPayload): tour blocks, reachability, " +
-				"affordances. { send: false } when there is nothing pending -- DESIGN.md §10's \"no 'nothing new today' mail\" " +
-				'means this is the normal, common result, not an error.',
+				'Returns the concerts waiting to be told to one subscriber, grouped by tour with travel options attached. ' +
+				"Returns { send: false } when nothing is waiting -- that's normal and common; most days there's nothing.",
 			inputSchema: z.object({ subscriber_id: z.number().int().positive() }),
 		},
 		async ({ subscriber_id }) => {
@@ -213,10 +228,10 @@ export function buildMcpServer(db: D1Database, env: McpEnv): McpServer {
 		'submit_digest',
 		{
 			description:
-				"Hands back the rendered HTML/text for a subscriber's pending digest; the Worker sends it via the " +
-				"configured mailer and marks the covered notifications' sent_at once delivery is confirmed. Idempotent: " +
-				're-submitting after a successful send is a no-op ({ sent: false, reason: "no_pending_notifications" }), ' +
-				'since the covering notifications no longer have sent_at IS NULL.',
+				"Sends a subscriber's pending digest by email using the given HTML and plain-text content, then marks the " +
+				"concerts it covered as delivered so they won't be included in a future digest. Idempotent: calling this " +
+				'again after a successful send is a no-op ({ sent: false, reason: "no_pending_notifications" }), since ' +
+				'there is nothing left pending to send.',
 			inputSchema: z.object({
 				subscriber_id: z.number().int().positive(),
 				html: z.string().min(1),
@@ -295,9 +310,10 @@ export function buildMcpServer(db: D1Database, env: McpEnv): McpServer {
 		'get_sweep_targets',
 		{
 			description:
-				'Every `dark`-coverage artist due a Claude search sweep (DESIGN.md §6.2/§6.4). At this scale (§6.3: ' +
-				'"every artist is polled every day," no rotation) this is every dark artist, unfiltered by last_polled_at ' +
-				'-- see PROGRESS.md for why no staleness filtering was added.',
+				'Artists with no reliable automated source for their tour dates, so a live web search sweep is the only ' +
+				'way to find out what is on for them. Returns every such artist due for a sweep -- at the current scale ' +
+				"that's every artist tracked this way, not filtered by how recently each was last checked, so the same " +
+				'list can come back day after day if nothing has changed.',
 			inputSchema: z.object({}),
 		},
 		async () => {
@@ -320,11 +336,10 @@ export function buildMcpServer(db: D1Database, env: McpEnv): McpServer {
 		'submit_sweep_results',
 		{
 			description:
-				'Normalised events the search sweep found for one dark artist. Runs through the same normaliser/fingerprint ' +
-				'upsert as the daily poll (src/sources/normalise.ts, src/core/poll.ts) -- the model never writes to `events` ' +
-				"directly. Idempotent via upsertEventByFingerprint's ON CONFLICT. Does NOT cluster into tours or decide " +
-				'notifications -- that happens in the same pass the daily poll itself feeds (S3.3), not here, matching ' +
-				"poll.ts's own event/cluster/notify separation.",
+				'Submits events a web-search sweep found for one artist, to be stored the same way any other discovered ' +
+				'date is. Safe to call more than once with the same events -- resubmitting an event already on file ' +
+				'updates it in place rather than duplicating it. Does not group dates into tours or decide who gets ' +
+				'notified about them; that happens in a separate, later pass.',
 			inputSchema: z.object({
 				artist_id: z.number().int().positive(),
 				events: z.array(submittedEventSchema),
@@ -343,10 +358,10 @@ export function buildMcpServer(db: D1Database, env: McpEnv): McpServer {
 		'get_unparsed_pages',
 		{
 			description:
-				"Tour pages that changed but carried no usable JSON-LD MusicEvent data (src/sources/tourpage.ts's " +
-				'needs_model_parse result, durably queued in `pending_page_parses` -- migrations/0003). HTML is capped at ' +
-				`${MAX_HTML_CHARS.toLocaleString()} characters per page as a safety margin before it can reach a model, ` +
-				'per DESIGN.md §12.4\'s "truncate any fetched page to a fixed byte ceiling before it can reach a model."',
+				'Tour pages that recently changed but whose content could not be automatically read as structured event data, ' +
+				'so a person (or model) needs to read the page text and pull out the dates by hand. Each entry includes the ' +
+				`page's raw HTML, truncated to ${MAX_HTML_CHARS.toLocaleString()} characters if the page is very large, as a ` +
+				'safety margin.',
 			inputSchema: z.object({}),
 		},
 		async () => {
@@ -373,9 +388,9 @@ export function buildMcpServer(db: D1Database, env: McpEnv): McpServer {
 		'submit_parsed_events',
 		{
 			description:
-				"Events extracted by a model parse of one artist's tour page (from get_unparsed_pages). Same normaliser/" +
-				"upsert path as submit_sweep_results. Clears that artist's pending_page_parses row on success -- a repeat " +
-				'call after that (idempotent) is just a no-op deletion the second time.',
+				"Submits events extracted by reading one artist's tour page (the pages returned by get_unparsed_pages), " +
+				'to be stored the same way any other discovered date is. Also marks that page as handled so it stops ' +
+				'showing up in get_unparsed_pages. Safe to call more than once for the same page.',
 			inputSchema: z.object({
 				artist_id: z.number().int().positive(),
 				events: z.array(submittedEventSchema),
@@ -390,15 +405,56 @@ export function buildMcpServer(db: D1Database, env: McpEnv): McpServer {
 		},
 	);
 
+	// -- get_current_routes(origin_iata?) -------------------------------------
+	server.registerTool(
+		'get_current_routes',
+		{
+			description:
+				"Scheduled-task only. The travel-reachability data currently on file for one origin airport's routes -- " +
+				'destination city, a difficulty tier from A (easy) to D (hard), and a human-readable note naming the ' +
+				'airline and roughly how often it flies (e.g. "direct CLJ→LBA, Wizz Air, ~3/wk"). Call this before ' +
+				'researching a reachability refresh so only what actually changed needs submitting to refresh_reachability, ' +
+				'instead of re-researching every route from scratch each time. Pass origin_iata (e.g. "CLJ") to work one ' +
+				'airport at a time -- all origins together can be several hundred rows, too much to return unfiltered in ' +
+				'one call.',
+			inputSchema: z.object({
+				origin_iata: z
+					.string()
+					.length(3)
+					.optional()
+					.describe('Three-letter IATA airport code, e.g. "CLJ". Omit only if you actually want every origin at once.'),
+			}),
+		},
+		async ({ origin_iata }) => {
+			const rows = await getReachabilityByOrigin(db, origin_iata);
+			return textResult({
+				origin_iata: origin_iata ?? null,
+				count: rows.length,
+				routes: rows.map((r) => ({
+					origin_iata: r.origin_iata,
+					destination_city_key: r.city_key,
+					tier: r.tier,
+					route_note: r.route_note,
+					computed_at: r.computed_at,
+				})),
+			});
+		},
+	);
+
 	// -- refresh_reachability(rows) -------------------------------------------
 	server.registerTool(
 		'refresh_reachability',
 		{
 			description:
-				'Monthly reachability refresh (DESIGN.md §7): persists precomputed origin/reachability rows into D1. Tier ' +
-				"derivation itself happens on the caller's side (the app-quota Claude run, per §7's \"refreshed monthly by " +
-				'a Claude run"); this tool only upserts whatever it\'s handed, the same idempotent upserts scripts/seed-' +
-				'reach.ts (S1.2) already uses.',
+				'Refreshes the travel-reachability data on file. Meant to be run roughly once a quarter -- airline route ' +
+				'networks mostly change at the seasonal schedule changes in late March and late October, so a monthly pass ' +
+				'would mostly just re-confirm nothing moved. This is a PARTIAL update: pass only the rows that changed ' +
+				'since the last refresh (call get_current_routes first to see what is already on file), not the full set. ' +
+				"Researching what a route's tier and note should be happens before calling this tool; this tool only saves " +
+				"or deletes whatever it's given. To add or update a route, put a row in origins/reachability; to remove a " +
+				'route that no longer exists (simply leaving it out of the submitted rows is NOT read as "removed" -- it ' +
+				'only means "unchanged"), put its {city_key, origin_iata} in remove_reachability, or its iata code in ' +
+				'remove_origins if an entire origin airport is gone.',
 			inputSchema: z.object({
 				origins: z
 					.array(
@@ -410,18 +466,30 @@ export function buildMcpServer(db: D1Database, env: McpEnv): McpServer {
 							penalty_minutes: z.number().nullable().optional(),
 						}),
 					)
-					.optional(),
-				reachability: z.array(
-					z.object({
-						city_key: z.string(),
-						origin_iata: z.string().length(3),
-						tier: z.enum(['A', 'B', 'C', 'D']),
-						route_note: z.string().nullable().optional(),
-					}),
-				),
+					.optional()
+					.describe('Origins to add or update. Omit or leave empty if only reachability rows changed.'),
+				reachability: z
+					.array(
+						z.object({
+							city_key: z.string(),
+							origin_iata: z.string().length(3),
+							tier: z.enum(['A', 'B', 'C', 'D']),
+							route_note: z.string().nullable().optional(),
+						}),
+					)
+					.optional()
+					.describe('Reachability rows to add or update -- only the ones that changed, not the full table.'),
+				remove_reachability: z
+					.array(z.object({ city_key: z.string(), origin_iata: z.string().length(3) }))
+					.optional()
+					.describe('Reachability rows to delete outright -- e.g. a route that was discontinued this season.'),
+				remove_origins: z
+					.array(z.string().length(3))
+					.optional()
+					.describe('Origin airports to delete outright. Their reachability rows are not cascade-deleted -- list those separately above.'),
 			}),
 		},
-		async ({ origins, reachability }) => {
+		async ({ origins, reachability, remove_reachability, remove_origins }) => {
 			for (const o of origins ?? []) {
 				await upsertOrigin(db, {
 					iata: o.iata,
@@ -431,7 +499,7 @@ export function buildMcpServer(db: D1Database, env: McpEnv): McpServer {
 					penalty_minutes: o.penalty_minutes ?? null,
 				});
 			}
-			for (const r of reachability) {
+			for (const r of reachability ?? []) {
 				await upsertReachability(db, {
 					city_key: r.city_key,
 					origin_iata: r.origin_iata,
@@ -439,7 +507,18 @@ export function buildMcpServer(db: D1Database, env: McpEnv): McpServer {
 					route_note: r.route_note ?? null,
 				});
 			}
-			return textResult({ origins_upserted: origins?.length ?? 0, reachability_upserted: reachability.length });
+			for (const rm of remove_reachability ?? []) {
+				await deleteReachability(db, rm.city_key, rm.origin_iata);
+			}
+			for (const iata of remove_origins ?? []) {
+				await deleteOrigin(db, iata);
+			}
+			return textResult({
+				origins_upserted: origins?.length ?? 0,
+				reachability_upserted: reachability?.length ?? 0,
+				reachability_removed: remove_reachability?.length ?? 0,
+				origins_removed: remove_origins?.length ?? 0,
+			});
 		},
 	);
 
@@ -476,6 +555,156 @@ export function buildMcpServer(db: D1Database, env: McpEnv): McpServer {
 		},
 	);
 
+	// -- mint_subscriber_token(subscriber_id) --------------------------------
+	server.registerTool(
+		'mint_subscriber_token',
+		{
+			description:
+				'Generates a fresh, random access credential for one subscriber and saves it, replacing any credential that ' +
+				'subscriber already had. Give the returned token to that person as part of their own private connection URL: ' +
+				'anyone holding it can act only as that one subscriber (view and manage only their own watchlist), never as ' +
+				'anyone else and never as the scheduled task this admin credential itself represents.',
+			inputSchema: z.object({
+				subscriber_id: z.number().int().positive().describe('The subscriber to generate a credential for.'),
+			}),
+		},
+		async ({ subscriber_id }) => {
+			const subscriber = await getSubscriberById(db, subscriber_id);
+			if (!subscriber) return errorResult(`mint_subscriber_token: no subscriber with id ${subscriber_id}`);
+			const token = generateSubscriberToken();
+			await setSubscriberMcpToken(db, subscriber_id, token);
+			return textResult({ subscriber_id, email: subscriber.email, token });
+		},
+	);
+
+	return server;
+}
+
+/**
+ * CSPRNG token generation (S5.3's own explicit requirement: `crypto.getRandomValues`,
+ * not `Math.random`, since a guessable token would defeat the whole point of a
+ * per-person credential). `crypto` here is the Web Crypto global every
+ * Cloudflare Worker already has -- no `nodejs_compat` flag, no `node:crypto`
+ * import (wrangler.jsonc has neither, and this repo has stayed off that flag
+ * throughout, per this file's own header note on runtime deps). 32 random
+ * bytes hex-encoded -> a 64-character token, comfortably beyond brute-force
+ * range for a bearer credential.
+ */
+function generateSubscriberToken(): string {
+	const bytes = new Uint8Array(32);
+	crypto.getRandomValues(bytes);
+	return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+/**
+ * Turns one `AgentToolDefinition`'s `input_schema` (plain JSON Schema, the
+ * shape Anthropic's Messages API expects -- see `src/agent/tools.ts`) into
+ * the Zod raw shape `McpServer.registerTool` needs. Deliberately narrow: it
+ * only understands the handful of JSON Schema shapes the agent tool
+ * catalogue actually uses today (string/integer/number/boolean leaves,
+ * `enum`, `array` of objects, nested `object`, `required`) rather than being
+ * a general-purpose converter -- if a future tool's schema needs more than
+ * this, extend it here rather than reaching for a dependency.
+ *
+ * `jsonSchemaPropertyToZod` handles one property node and recurses for
+ * `array`/`object` so a field like `add_artists`'s `bands` (an array of
+ * `{ name, priority? }` objects) round-trips correctly instead of falling
+ * through to the plain-string default every other leaf type used to fall
+ * back to (the bug this fixed: an `array` property with no explicit case
+ * silently became `z.string()`, which rejected every real call).
+ */
+function jsonSchemaPropertyToZod(prop: Record<string, unknown>): z.ZodTypeAny {
+	let field: z.ZodTypeAny;
+	if (Array.isArray(prop.enum)) {
+		const values = prop.enum as string[];
+		field = z.enum(values as [string, ...string[]]);
+	} else if (prop.type === 'array') {
+		const items = (prop.items ?? {}) as Record<string, unknown>;
+		field = z.array(jsonSchemaPropertyToZod(items));
+	} else if (prop.type === 'object') {
+		field = z.object(agentInputSchemaToZodShape(prop));
+	} else if (prop.type === 'integer') {
+		field = z.number().int();
+	} else if (prop.type === 'number') {
+		field = z.number();
+	} else if (prop.type === 'boolean') {
+		field = z.boolean();
+	} else {
+		field = z.string();
+	}
+	if (typeof prop.description === 'string') field = field.describe(prop.description);
+	return field;
+}
+
+function agentInputSchemaToZodShape(inputSchema: Record<string, unknown>): Record<string, z.ZodTypeAny> {
+	const properties = (inputSchema.properties ?? {}) as Record<string, Record<string, unknown>>;
+	const required = new Set((inputSchema.required as string[] | undefined) ?? []);
+	const shape: Record<string, z.ZodTypeAny> = {};
+
+	for (const [key, prop] of Object.entries(properties)) {
+		let field = jsonSchemaPropertyToZod(prop);
+		if (!required.has(key)) field = field.optional();
+		shape[key] = field;
+	}
+
+	return shape;
+}
+
+/**
+ * The subscriber-facing MCP surface (S5.3): the agent tool catalogue
+ * (`AGENT_TOOLS`, S4.5's `src/agent/tools.ts`) exposed over MCP, one fresh
+ * `McpServer` per request exactly like `buildMcpServer` above. The identity
+ * behind every call is `subscriberId`, resolved once by `routeMcpRequest`
+ * from the request's own bearer token -- never an argument a caller
+ * supplies, which is what makes handing someone this URL safe: nothing they
+ * type can make a tool act on another subscriber's data, because there is
+ * no field to put another subscriber's id into in the first place. Every
+ * tool's actual ownership check still lives in `src/agent/tools.ts` itself
+ * (scoped queries, affected-row checks) -- this function only resolves who
+ * `ctx.subscriberId` is and calls `callAgentTool`; it does not re-implement
+ * or weaken any of those checks.
+ *
+ * Deliberately does NOT register any of `buildMcpServer`'s scheduled-task
+ * tools -- a subscriber token has no business seeing `submit_digest`,
+ * `get_sweep_targets`, `refresh_reachability`, etc., all of which act
+ * outside any one subscriber's own data or spend real budget on the
+ * scheduled task's behalf.
+ */
+export function buildSubscriberMcpServer(db: D1Database, env: McpEnv, subscriberId: number): McpServer {
+	const server = new McpServer({ name: 'concert-watch', version: '1.0.0' });
+
+	const ctx: AgentToolContext = {
+		db,
+		subscriberId,
+		anthropicApiKey: env.ANTHROPIC_API_KEY ?? '',
+		ticketmasterApiKey: env.TICKETMASTER_API_KEY ?? '',
+		// A fresh cap per request, not per subscriber conversation -- see
+		// PROGRESS.md's S5.3 entry: this endpoint issues one McpServer per
+		// HTTP request (matching buildMcpServer's own documented model), so
+		// the "3 web searches per email" cap this same counter enforces for
+		// the email reply path does not carry across separate MCP tool calls
+		// here. Flagged as a known gap, not silently accepted.
+		webSearchState: createWebSearchState(),
+	};
+
+	for (const tool of AGENT_TOOLS) {
+		server.registerTool(
+			tool.name,
+			{
+				description: tool.description,
+				inputSchema: z.object(agentInputSchemaToZodShape(tool.input_schema)),
+			},
+			async (input) => {
+				try {
+					const output = await callAgentTool(tool.name, input, ctx);
+					return textResult(output);
+				} catch (err) {
+					return errorResult(`${tool.name}: ${err instanceof Error ? err.message : String(err)}`);
+				}
+			},
+		);
+	}
+
 	return server;
 }
 
@@ -502,11 +731,23 @@ const MCP_PATH_PREFIX = '/mcp/';
 
 /**
  * Builds a fresh MCP HTTP handler bound to this request's `env` and returns
- * its response. Called only after `routeMcpRequest` has already verified the
- * bearer token, so it performs no auth itself.
+ * its response, serving the scheduled-task tool catalogue. Called only after
+ * `routeMcpRequest` has already verified the admin bearer token, so it
+ * performs no auth itself.
  */
 export async function handleMcpRequest(request: Request, env: McpEnv): Promise<Response> {
 	const handler = createMcpHandler(() => buildMcpServer(env.DB, env));
+	return handler.fetch(request);
+}
+
+/**
+ * S5.3: same shape as `handleMcpRequest` above, but serving one resolved
+ * subscriber's own agent tool catalogue (`buildSubscriberMcpServer`).
+ * Called only after `routeMcpRequest` has already resolved `subscriberId`
+ * from the request's bearer token, so it performs no auth itself either.
+ */
+export async function handleSubscriberMcpRequest(request: Request, env: McpEnv, subscriberId: number): Promise<Response> {
+	const handler = createMcpHandler(() => buildSubscriberMcpServer(env.DB, env, subscriberId));
 	return handler.fetch(request);
 }
 
@@ -515,16 +756,32 @@ export async function handleMcpRequest(request: Request, env: McpEnv): Promise<R
  * Returns `null` for any request outside the `/mcp/` path so the caller can
  * fall through to its other routes unchanged; returns a `Response` (success
  * or the 404 auth rejection) for anything under it.
+ *
+ * Two credentials share this one path prefix (S5.3): the single admin
+ * secret (`MCP_AUTH_TOKEN`) is checked first -- a plain equality check, same
+ * as before this step -- and only when that doesn't match does the token get
+ * looked up as a per-subscriber credential in `subscribers.mcp_token`. A
+ * token that is neither gets the same 404 an unauthenticated request always
+ * got, so probing this endpoint still can't distinguish "wrong token" from
+ * "route doesn't exist" (this file's own long-standing 401-vs-404 reasoning,
+ * unchanged by adding a second credential kind).
  */
 export async function routeMcpRequest(request: Request, env: McpEnv): Promise<Response | null> {
 	const url = new URL(request.url);
 	if (!url.pathname.startsWith(MCP_PATH_PREFIX)) return null;
 
 	const token = url.pathname.slice(MCP_PATH_PREFIX.length).split('/')[0];
-	const expected = env.MCP_AUTH_TOKEN;
-	if (!expected || !token || token !== expected) {
-		return new Response('Not found', { status: 404 });
+	if (!token) return new Response('Not found', { status: 404 });
+
+	const adminToken = env.MCP_AUTH_TOKEN;
+	if (adminToken && token === adminToken) {
+		return handleMcpRequest(request, env);
 	}
 
-	return handleMcpRequest(request, env);
+	const subscriber = await getSubscriberByMcpToken(env.DB, token);
+	if (subscriber) {
+		return handleSubscriberMcpRequest(request, env, subscriber.id);
+	}
+
+	return new Response('Not found', { status: 404 });
 }

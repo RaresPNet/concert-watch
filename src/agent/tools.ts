@@ -50,11 +50,13 @@ import {
 	removeFromWatchlist,
 	setWatchlistPriority,
 } from '../db/queries';
-import type { ArtistRow, Priority, TourRow } from '../db/schema';
+import type { ArtistRow, Priority, ReachabilityTier, TourRow } from '../db/schema';
 import { resolveArtist, type ArtistResolutionResult, type ResolveArtistOptions } from '../core/resolve';
 import { attachReachabilityToTour, pickBestReachability } from '../core/reach';
+import { acquireArtist, type AcquireArtistResult } from '../core/acquire';
 import { MODEL_SONNET, estimateCost, type AnthropicToolDef } from '../model/client';
 import type { MusicBrainzArtistCandidate } from '../sources/musicbrainz';
+import { TicketmasterAdapter } from '../sources/ticketmaster';
 
 const ANTHROPIC_MESSAGES_URL = 'https://api.anthropic.com/v1/messages';
 const ANTHROPIC_API_VERSION = '2023-06-01';
@@ -124,8 +126,21 @@ export interface AddArtistInput {
 	priority?: Priority;
 }
 
+/** Compact "what's already on" summary attached to a resolved add_artist result -- see buildAcquisitionSummary. */
+export interface AddArtistAcquisitionSummary {
+	tour_count: number;
+	date_count: number;
+	nearest_reachable_date: { starts_at: string; city: string | null; country: string | null; tier: ReachabilityTier | null } | null;
+}
+
 export type AddArtistOutput =
-	| { resolved: true; artist: { id: number; name: string; priority: Priority }; already_watching: boolean }
+	| {
+			resolved: true;
+			artist: { id: number; name: string; priority: Priority };
+			already_watching: boolean;
+			/** What's already on for this band, fetched immediately rather than waiting for tomorrow's poll. */
+			acquisition: AddArtistAcquisitionSummary;
+	  }
 	| {
 			resolved: false;
 			ambiguous: true;
@@ -137,14 +152,22 @@ const DEFAULT_ADD_PRIORITY: Priority = 'P3';
 /** Ambiguous candidates are capped here, independent of whatever `resolveArtist` gathered -- the model gets a short did-you-mean, never a full MusicBrainz candidate dump (tool design principle above). */
 const MAX_AMBIGUOUS_CANDIDATES = 5;
 
-async function handleAddArtist(input: AddArtistInput, ctx: AgentToolContext): Promise<AddArtistOutput> {
+/**
+ * One band's full resolve-and-acquire pipeline: resolve the free-text name,
+ * insert/find the `artists` row, add it to this subscriber's watchlist (or
+ * find the existing entry), and acquire its current tour data. Shared by
+ * `add_artist` (one band) and `add_artists` (S5.2, many bands in one tool
+ * call) so the per-band logic exists exactly once -- `add_artists` is just
+ * this function called in a loop, with its own grouping of the results.
+ */
+async function resolveAndAddOneArtist(name: string, priorityInput: Priority | undefined, ctx: AgentToolContext): Promise<AddArtistOutput> {
 	const resolveOpts: ResolveArtistOptions = {
 		anthropicApiKey: ctx.anthropicApiKey,
 		ticketmasterApiKey: ctx.ticketmasterApiKey,
 		fetchImpl: ctx.fetchImpl,
 		musicbrainzLookup: ctx.musicbrainzLookup,
 	};
-	const result: ArtistResolutionResult = await resolveArtist(input.name, resolveOpts);
+	const result: ArtistResolutionResult = await resolveArtist(name, resolveOpts);
 
 	if ('ambiguous' in result) {
 		return {
@@ -181,22 +204,38 @@ async function handleAddArtist(input: AddArtistInput, ctx: AgentToolContext): Pr
 	}
 
 	const existingEntry = await getWatchlistEntry(ctx.db, ctx.subscriberId, artistId);
-	const priority = existingEntry?.priority ?? input.priority ?? DEFAULT_ADD_PRIORITY;
+	const priority = existingEntry?.priority ?? priorityInput ?? DEFAULT_ADD_PRIORITY;
 	if (!existingEntry) {
 		await addToWatchlist(ctx.db, { subscriber_id: ctx.subscriberId, artist_id: artistId, priority });
 	}
+
+	const acquired: AcquireArtistResult = await acquireArtist(artistId, {
+		db: ctx.db,
+		ticketmasterAdapter: new TicketmasterAdapter({ apiKey: ctx.ticketmasterApiKey, db: ctx.db, fetchImpl: ctx.fetchImpl }),
+		tourPageFetchImpl: ctx.fetchImpl,
+		now: () => (ctx.now ?? (() => new Date()))().toISOString(),
+	});
 
 	return {
 		resolved: true,
 		artist: { id: artistId, name: r.name, priority },
 		already_watching: existingEntry !== null,
+		acquisition: {
+			tour_count: acquired.tour_count,
+			date_count: acquired.date_count,
+			nearest_reachable_date: acquired.nearest_reachable_date,
+		},
 	};
+}
+
+async function handleAddArtist(input: AddArtistInput, ctx: AgentToolContext): Promise<AddArtistOutput> {
+	return resolveAndAddOneArtist(input.name, input.priority, ctx);
 }
 
 const addArtistTool: AgentToolDefinition<AddArtistInput, AddArtistOutput> = {
 	name: 'add_artist',
 	description:
-		"Resolves a free-text band name and adds it to the acting subscriber's watchlist. Returns either the resolved artist (with its watchlist priority) or, when the name is genuinely ambiguous, a short list of candidates plus a did-you-mean question -- never a guess.",
+		"Resolves a free-text band name and adds it to the acting subscriber's watchlist. Also immediately checks that band's known tour sources, so a resolved result comes back with a summary of what's already on: how many upcoming tours, how many dates total, and the single most reachable upcoming date, if any. Returns either that resolved artist (with its watchlist priority and summary) or, when the name is genuinely ambiguous, a short list of candidates plus a did-you-mean question -- never a guess.",
 	input_schema: {
 		type: 'object',
 		properties: {
@@ -211,6 +250,117 @@ const addArtistTool: AgentToolDefinition<AddArtistInput, AddArtistOutput> = {
 		additionalProperties: false,
 	},
 	handler: handleAddArtist,
+};
+
+// ---------------------------------------------------------------------------
+// add_artists (S5.2 -- add many bands in one tool call)
+// ---------------------------------------------------------------------------
+
+export interface AddArtistsInput {
+	bands: Array<{ name: string; priority?: Priority }>;
+}
+
+export interface AddArtistsResolvedEntry {
+	input_name: string;
+	artist: { id: number; name: string; priority: Priority };
+	already_watching: boolean;
+	acquisition: AddArtistAcquisitionSummary;
+}
+
+export interface AddArtistsAmbiguousEntry {
+	input_name: string;
+	candidates: Array<{ name: string; disambiguation: string | null; country: string | null }>;
+	question: string;
+}
+
+export interface AddArtistsNotFoundEntry {
+	input_name: string;
+	reason: string;
+}
+
+export interface AddArtistsOutput {
+	resolved: AddArtistsResolvedEntry[];
+	ambiguous: AddArtistsAmbiguousEntry[];
+	not_found: AddArtistsNotFoundEntry[];
+}
+
+/**
+ * S5.2: onboarding a long list of bands (e.g. a 25-band "here's everything
+ * I follow" email) one at a time through `add_artist` would spend one tool
+ * call per band against `MAX_TOOL_CALLS_PER_SESSION` -- this tool does the
+ * same resolve-and-acquire work for the whole list inside a single call, so
+ * list length no longer competes with the per-email tool-call cap.
+ *
+ * Bands are processed one at a time, in order, not concurrently: MusicBrainz
+ * lookups (inside `resolveArtist`) already share one process-wide 1-request-
+ * per-second throttle (`src/sources/musicbrainz.ts`), so running them
+ * concurrently would not make the MusicBrainz portion any faster, and
+ * sequencing everything else the same way keeps this straightforward and
+ * avoids concurrent writes to the same subscriber's watchlist rows. See
+ * PROGRESS.md's S5.2 entry for the resulting wall-clock estimate for 25
+ * bands and why it fits inside a Worker's CPU-time budget despite that.
+ *
+ * A band that throws partway through (a real fetch/API failure, not a
+ * resolution ambiguity) is caught here and reported in `not_found` with the
+ * error message as `reason`, rather than aborting the whole list -- one
+ * flaky source must not cost the subscriber every other band in the email.
+ */
+async function handleAddArtists(input: AddArtistsInput, ctx: AgentToolContext): Promise<AddArtistsOutput> {
+	const resolved: AddArtistsResolvedEntry[] = [];
+	const ambiguous: AddArtistsAmbiguousEntry[] = [];
+	const not_found: AddArtistsNotFoundEntry[] = [];
+
+	for (const band of input.bands) {
+		try {
+			const result = await resolveAndAddOneArtist(band.name, band.priority, ctx);
+			if (result.resolved) {
+				resolved.push({
+					input_name: band.name,
+					artist: result.artist,
+					already_watching: result.already_watching,
+					acquisition: result.acquisition,
+				});
+			} else {
+				ambiguous.push({ input_name: band.name, candidates: result.candidates, question: result.question });
+			}
+		} catch (err) {
+			not_found.push({ input_name: band.name, reason: err instanceof Error ? err.message : String(err) });
+		}
+	}
+
+	return { resolved, ambiguous, not_found };
+}
+
+const addArtistsTool: AgentToolDefinition<AddArtistsInput, AddArtistsOutput> = {
+	name: 'add_artists',
+	description:
+		'Adds many bands to the acting subscriber\'s watchlist in one call -- use this instead of calling add_artist repeatedly whenever the subscriber lists more than one or two bands at once (e.g. onboarding a whole list). Each band is resolved and its current tours fetched exactly as add_artist would, independently of the others, so one bad or ambiguous name never blocks the rest. Returns three groups: "resolved" (added, with a summary of what\'s already on for each), "ambiguous" (a name that matched more than one band -- each comes with a short did-you-mean question to relay to the subscriber), and "not_found" (a band that could not be processed, with a plain-text reason). A normal result often has entries in more than one group at once; that is not a failure.',
+	input_schema: {
+		type: 'object',
+		properties: {
+			bands: {
+				type: 'array',
+				description: 'The bands to add, in the order the subscriber listed them.',
+				items: {
+					type: 'object',
+					properties: {
+						name: { type: 'string', description: 'The band name as the subscriber wrote it.' },
+						priority: {
+							type: 'string',
+							enum: ['P1', 'P2', 'P3', 'P4'],
+							description: "Optional. Defaults to 'P3' if the subscriber didn't state one for this band.",
+						},
+					},
+					required: ['name'],
+					additionalProperties: false,
+				},
+				minItems: 1,
+			},
+		},
+		required: ['bands'],
+		additionalProperties: false,
+	},
+	handler: handleAddArtists,
 };
 
 // ---------------------------------------------------------------------------
@@ -271,7 +421,7 @@ async function handleSetPriority(input: SetPriorityInput, ctx: AgentToolContext)
 const setPriorityTool: AgentToolDefinition<SetPriorityInput, SetPriorityOutput> = {
 	name: 'set_priority',
 	description:
-		"Changes a watched band's priority (P1 chase / P2 travel / P3 regional / P4 local -- DESIGN.md §8) on the acting subscriber's own watchlist, by artist id.",
+		"Changes a watched band's priority on the acting subscriber's own watchlist, by artist id (P1 = chase it anywhere, P2 = worth travelling for, P3 = regional, P4 = local only).",
 	input_schema: {
 		type: 'object',
 		properties: {
@@ -460,7 +610,7 @@ async function handleGetReachability(input: GetReachabilityInput, ctx: AgentTool
 const getReachabilityTool: AgentToolDefinition<GetReachabilityInput, GetReachabilityOutput> = {
 	name: 'get_reachability',
 	description:
-		'Looks up how reachable a city is from Cluj, from the precomputed reachability table (DESIGN.md §7) -- one line: tier, origin airport, route note. Never derive a route yourself; always call this instead.',
+		'Looks up how reachable a city is from Cluj, from precomputed travel data -- one line: difficulty tier, origin airport, and a route note. Never derive a route yourself; always call this instead.',
 	input_schema: {
 		type: 'object',
 		properties: { city: { type: 'string', description: 'A city name, e.g. "Leeds" or "Prague".' } },
@@ -492,7 +642,7 @@ async function handleSavePreference(input: SavePreferenceInput, ctx: AgentToolCo
 const savePreferenceTool: AgentToolDefinition<SavePreferenceInput, SavePreferenceOutput> = {
 	name: 'save_preference',
 	description:
-		'Records a standing preference the subscriber stated in conversation (e.g. "I won\'t fly Ryanair", "never a Sunday night return") so future trip-planning replies honour it (DESIGN.md §11.3). Appends; does not overwrite earlier preferences.',
+		'Records a standing preference the subscriber stated in conversation (e.g. "I won\'t fly Ryanair", "never a Sunday night return") so future trip-planning replies honour it. Appends; does not overwrite earlier preferences.',
 	input_schema: {
 		type: 'object',
 		properties: { text: { type: 'string', description: 'The preference, in the subscriber’s own words or a short paraphrase.' } },
@@ -666,6 +816,7 @@ const escalateTool: AgentToolDefinition<EscalateInput, EscalateOutput> = {
 export const AGENT_TOOLS: AgentToolDefinition[] = [
 	listWatchlistTool,
 	addArtistTool,
+	addArtistsTool,
 	removeArtistTool,
 	setPriorityTool,
 	getTourTool,

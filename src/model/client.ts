@@ -170,8 +170,15 @@ export class ModelCallError extends Error {
 // Hard caps (DESIGN.md §11.5 / §12.4)
 // ---------------------------------------------------------------------------
 
-/** "Hard caps per email: 8 tool calls..." (DESIGN.md §11.5). */
-export const MAX_TOOL_CALLS_PER_SESSION = 8;
+/**
+ * "Hard caps per email: 8 tool calls..." (DESIGN.md §11.5) originally, raised
+ * to 20 in S5.2: 8 was an anti-runaway guess, not a cost control, and a real
+ * multi-band onboarding reply (via `add_artists`, one call regardless of
+ * list length) or a trip-planning turn can legitimately spend several tool
+ * calls before writing a word. `MAX_INPUT_TOKENS_PER_SESSION` below is the
+ * real cost control and is unchanged.
+ */
+export const MAX_TOOL_CALLS_PER_SESSION = 20;
 /** "...40k total input tokens..." (DESIGN.md §11.5). */
 export const MAX_INPUT_TOKENS_PER_SESSION = 40_000;
 
