@@ -18,6 +18,14 @@
 import { emailHandler } from './mail/inbound';
 import { resolveArtist } from './core/resolve';
 import { routeMcpRequest } from './mcp/server';
+import { runDailySchedule, shouldRunForCron, type ScheduleEnv } from './core/schedule';
+
+// Same domain S1.3 verified a real send against, and the same default every
+// other file reading DIGEST_FROM_ADDRESS off `env as any` falls back to
+// (`src/mcp/server.ts`, `src/mail/inbound.ts`) -- kept in sync by literal
+// value per this repo's established convention for a secret with no
+// declared binding.
+const DEFAULT_FROM_ADDRESS = 'concert-watch@raresp.net';
 
 export default {
 	// S1.4: inbound mail capture. Logic lives in src/mail/inbound.ts; this is
@@ -58,18 +66,39 @@ export default {
 		return new Response(`To test the scheduled handler, ensure you have used the "--test-scheduled" then try running "curl ${url.href}".`);
 	},
 
-	// The scheduled handler is invoked at the interval set in our wrangler.jsonc's
-	// [[triggers]] configuration.
-	async scheduled(event, env, ctx): Promise<void> {
-		// A Cron Trigger can make requests to other endpoints on the Internet,
-		// publish to a Queue, query a D1 Database, and much more.
-		//
-		// We'll keep it simple and make an API call to a Cloudflare API:
-		let resp = await fetch('https://api.cloudflare.com/client/v4/ips');
-		let wasSuccessful = resp.ok ? 'success' : 'fail';
+	// S6.2: the daily poll -> cluster -> notify -> reach -> build-payload chain,
+	// the deferred-inbox sweep, and the 36h fallback/30-day heartbeat safety
+	// nets. Logic lives in src/core/schedule.ts; this is wiring only, same
+	// division as the `email` handler above.
+	async scheduled(event, env): Promise<void> {
+		const scheduleEnv = env as unknown as ScheduleEnv;
 
-		// You could store this result in KV, write to a D1 Database, or publish to a Queue.
-		// In this template, we'll just log the result:
-		console.log(`trigger fired at ${event.cron}: ${wasSuccessful}`);
+		if (!shouldRunForCron(event.cron, scheduleEnv)) {
+			console.log(`scheduled: cron "${event.cron}" is the optional second daily run and ENABLE_SECOND_CRON is not set -- skipping`);
+			return;
+		}
+
+		const result = await runDailySchedule({
+			db: scheduleEnv.DB,
+			email: scheduleEnv.EMAIL,
+			fromAddress: scheduleEnv.DIGEST_FROM_ADDRESS ?? DEFAULT_FROM_ADDRESS,
+			anthropicApiKey: scheduleEnv.ANTHROPIC_API_KEY ?? '',
+			ticketmasterApiKey: scheduleEnv.TICKETMASTER_API_KEY,
+			budgetEnv: scheduleEnv,
+		});
+
+		console.log(
+			`scheduled run (cron "${event.cron}") complete: ` +
+				JSON.stringify({
+					polled: result.poll.artistsPolled,
+					pollDeferred: result.poll.artistsDeferredToTomorrow,
+					clustered: result.cluster.length,
+					notified: result.notify.length,
+					inboxSwept: result.inboxSweep.rowsSwept,
+					inboxDeferred: result.inboxSweep.rowsDeferredToTomorrow,
+					fallbackSent: result.fallback.filter((f) => f.sent).length,
+					heartbeatSent: result.heartbeat.filter((h) => h.sent).length,
+				}),
+		);
 	},
 } satisfies ExportedHandler<Env>;

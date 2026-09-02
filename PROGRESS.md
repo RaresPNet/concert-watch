@@ -4835,3 +4835,242 @@ Worker is still the step's own stated Done-when and remains
 unverified from this environment, per this codebase's standing
 precedent for the reply path.
 ```
+
+
+## S6.2 — Cron wiring
+
+**Built.**
+- `src/core/schedule.ts` (new) — `runDailySchedule(deps)`, the one function
+  the Worker's `scheduled()` handler calls. Runs, in order, against real D1:
+  1. **Poll** — `getWatchedArtistsForPoll` (new, `src/db/queries.ts`) returns
+     every watched artist ordered `last_polled_at ASC`; the first
+     `maxArtistsPerRun` (default 60) are polled via S3.2's `pollOneArtist`,
+     the rest deferred to tomorrow (see "Judgment calls" below for why this
+     ordering, not the plan's literal "poll → cluster → notify → reach →
+     build payload" phrase, is what makes the deferral actually fair).
+  2. **Cluster** — S3.3's `clusterTours`, over *every* currently-watched
+     artist, not just the ones this run's poll touched. See the "flagged
+     gap this step's own scope forced it to fix" note below — this wasn't
+     optional.
+  3. **Notify** — S3.3's `runNotificationPass`, fed this run's
+     `clusterOutcomes` and the `changedEventIds` this run's poll pass itself
+     classified as `changed`.
+  4. **Reach + build payload** — S4.1's `buildAllDigestPayloads`, run for
+     its side-effect-free validation value only (see below); nothing is
+     stored or sent from this call.
+  5. **Deferred inbox sweep** — `getDeferredInboxMessages` (new,
+     `src/db/queries.ts`) returns every `deferred` inbox row, oldest first;
+     the first `maxDeferredRowsPerRun` (default 20) are handed to S4.6's
+     `handleInboxRow` via a row-scoped `CloudflareMailer` (identical to
+     S6.1's `emailHandler` construction), closing `handle.ts`'s own header
+     comment's forward reference ("called from two places -- the Email
+     Worker on live arrival, and (from S5.1, not yet built) the daily cron
+     sweeping deferred/failed rows").
+  6. **Fallback + heartbeat** — S4.8's `runFallbackDigestCheck`/
+     `runHeartbeatCheck`, given a `Mailer` scoped to every subscriber whose
+     `verified_at` is set (new `buildVerifiedSubscriberMailer` helper) --
+     neither of those two functions asserts `verified_at` itself, so this
+     reapplies the same trust boundary `submit_digest` already enforces.
+  - Every stage's outcome is returned in a `ScheduleResult` for the caller
+    to log; nothing is thrown for an individual bad row/artist (each stage
+    already carries its own per-item error handling from the steps that
+    built it).
+- Second-cron toggle: `PRIMARY_CRON`/`SECONDARY_CRON` constants and
+  `shouldRunForCron(cron, env)`, a pure function `src/index.ts`'s
+  `scheduled()` calls before doing any work. Defaults off
+  (`ENABLE_SECOND_CRON` unset or not `'true'`) -- an unrecognised cron string
+  (e.g. a manual `--test-scheduled` trigger, which fires with
+  `cron: '* * * * *'`) still runs, since silently doing nothing is the wrong
+  default for anything that isn't the one specific pattern this toggle
+  exists to gate.
+- `src/index.ts` — `scheduled()` replaced entirely (it was template
+  boilerplate: an unconditional `fetch` to Cloudflare's own IP-ranges API).
+  Now: check `shouldRunForCron`, then call `runDailySchedule` with a narrow
+  `ScheduleEnv` slice cast off `env` (same `as unknown as X` convention every
+  other file in this codebase uses for a wrangler secret with no declared
+  binding), then log a one-line JSON summary.
+- `src/db/queries.ts` — two new additive queries, same precedent this file's
+  own S4.6/S4.7/S6.1 entries already established for a query added from
+  within a later step because that step's own goal needs it and nothing
+  else provides it:
+  - `getWatchedArtistsForPoll` — every watched artist's full row, ordered
+    `last_polled_at ASC`. SQLite sorts `NULL` before any real value in
+    ascending order, so a never-polled artist is always most overdue.
+  - `getDeferredInboxMessages` — every `inbox` row with `status = 'deferred'`,
+    oldest (`received_at ASC`) first.
+
+**Judgment calls, flagged.**
+- **Cluster runs over every watched artist, not just the artist ids this
+  run's poll pass flagged as `inserted`/`changed`** -- a deliberate deviation
+  from the plan note's literal "poll → cluster → notify" reading of "cluster
+  what poll just found." Traced why before writing it this way:
+  `src/mcp/server.ts`'s `submit_sweep_results`/`submit_parsed_events` (S4.7,
+  the dark-artist sweep and tour-page-parse MCP tools the *scheduled Claude
+  task* calls) both persist events via the same `persistRawEvent` this
+  file's own poll stage uses, leaving them `tour_id IS NULL` exactly like a
+  freshly-polled event -- but neither MCP tool clusters what it just wrote,
+  and the only other caller of `clusterToursForArtist`
+  (`src/core/acquire.ts`) only ever clusters one just-added artist once, at
+  add-time. Restricting this run's cluster stage to poll's own outcomes
+  would have silently stranded every dark-artist-sweep and tour-page-parse
+  discovery as an untoured, unnotified `events` row forever -- there would
+  be no code path left anywhere in the system that ever clusters them.
+  `clusterToursForArtist` already no-ops (returns `null`) for an artist with
+  nothing pending, so this is cheap at today's scale regardless. Confirmed
+  by a fixture test: an event inserted directly (simulating an MCP-submitted
+  row) clusters and notifies correctly; restricting to poll-outcome artist
+  ids failed that same test until this change.
+- **`runNotificationPass`'s `changedEventIds` is still poll-outcome-only,
+  not widened the same way.** The equivalent gap exists for `material_change`
+  notifications on an event a sweep/tour-page-parse submission *changed*
+  (not newly inserted) -- `notify.ts`'s own API only accepts an explicit
+  list of changed event ids, with no query anywhere that answers "what
+  changed since the last notification pass" from D1 alone. Fixing this
+  properly needs a new capability in `notify.ts`/`queries.ts` (e.g. a
+  last-checked watermark), which is a materially different, more invasive
+  change than the cluster-stage fix above (that one was containable
+  entirely as an artist-id *selection* choice inside this file).
+  `notifyOnsaleSoon` inside the same pass is unaffected -- it already scans
+  every `events` row with an onsale date in the window regardless of who
+  wrote it, so onsale-soon notifications for MCP-submitted events already
+  work correctly today. Left as a real, surfaced gap rather than something
+  silently worked around, since `notify.ts` is outside this step's touch
+  list.
+- **`buildAllDigestPayloads` is called every run purely for its "does the
+  whole read-side chain still run without error" value** -- its result is
+  summarised (`subscriberId`/`send`) into `ScheduleResult` for the caller's
+  log line and then discarded; nothing is persisted or sent from it. This is
+  what this step's own plan note ("poll → cluster → notify → reach → build
+  payload, then stop... leaves the payload pending for the scheduled task to
+  collect") reads as once traced through: reachability/payload assembly is a
+  pure read over the `notifications` rows notify.ts just wrote, so the
+  scheduled Claude task's own `get_pending_digest` call recomputes the exact
+  same thing fresh later regardless of whether this file ran it first.
+  Running it here anyway is what makes "runs the whole chain... without
+  error" (this step's own Done-when) a real end-to-end exercise rather than
+  stopping two stages short of it.
+- **Per-run caps (`maxArtistsPerRun` default 60, `maxDeferredRowsPerRun`
+  default 20) are judgment calls, not derived numbers** -- DESIGN.md's own
+  "Still open" section only sizes the *dark-artist sweep* ("daily at 25
+  bands is affordable"), which is scheduled-task/app-quota work this file
+  never touches; nothing in DESIGN.md sizes this Worker's own poll/sweep
+  caps. Chosen comfortably above today's real scale (a handful of artists,
+  two subscribers) so neither cap is ever hit in practice yet, existing
+  purely so a busier future can't turn one bad day into an unbounded run,
+  per this step's own explicit instruction. Both are `ScheduleDeps` fields,
+  overridable per call (and thus per test) without an env var.
+- **The second-cron toggle has nothing to gate yet.** `wrangler.jsonc`'s
+  `triggers.crons` still lists only the one 08:00 EET entry -- adding
+  `SECONDARY_CRON` (20:00 EET) there is outside this step's touch list.
+  `shouldRunForCron`/`ENABLE_SECOND_CRON` are implemented and tested now so
+  that turning the second run on later is a two-line config change (the
+  `wrangler.jsonc` entry plus the env var) rather than new code, per the
+  plan's own "implement as a config toggle defaulting off, and record the
+  reasoning" instruction.
+- **`handleInboxRow`'s own attempts-exhausted guard means a sweep of a row
+  that already failed twice live is a harmless no-op, not a real retry** --
+  not a gap this step introduces (`src/mail/handle.ts` checks
+  `row.attempts >= MAX_LIVE_ATTEMPTS` unconditionally, regardless of caller,
+  and has no reset path anywhere in the codebase), and `handle.ts` is
+  outside this step's touch list. Budget-deferred and rate-limit-deferred
+  rows (the two cases that don't increment `attempts`) *do* get a genuine
+  retry from this sweep, which is the productive case DESIGN.md §12.5's
+  "picked up by tomorrow's scheduled run" describes. Flagged rather than
+  silently worked around.
+
+**Left undone.**
+- No live Cloudflare deploy exercised -- same standing limitation as every
+  prior model/network-touching step (no deploy access from this
+  environment). The step's own "Done when" ("a manually triggered scheduled
+  event runs the whole chain against real D1 without error") was verified
+  via a fixture harness instead (below), not a real `wrangler dev
+  --test-scheduled` invocation against the deployed Worker.
+- The `notify.ts` `changedEventIds` gap above (MCP-submitted material
+  changes) is real and unresolved -- see "Judgment calls."
+- CPU budget on the free plan was not measured for a full scheduled run
+  (poll + cluster + notify + payload + inbox sweep + fallback + heartbeat,
+  all in one invocation) -- not possible from this environment, same
+  standing gap S6.1's own entry already flagged for MIME parsing. Scheduled
+  Workers get a materially higher CPU ceiling than a request handler on most
+  plans, but this hasn't been confirmed against this project's actual free-
+  plan configuration; worth checking once there's deploy access, especially
+  if the watchlist or inbox backlog ever approaches either cap.
+
+**Verification performed.**
+```
+npx tsc --noEmit -p tsconfig.json                                      # clean
+npx prettier --check src/core/schedule.ts src/index.ts src/db/queries.ts  # clean
+
+# Fixture harness (node:sqlite DatabaseSync D1Database shim, real
+# migrations/0001-0006 replayed via raw.exec -- same convention as every
+# prior D1-backed step's harness) driving the real runDailySchedule end to
+# end: one subscriber, one artist, one pre-seeded untoured future event
+# (standing in for a prior poll/sweep discovery), a scripted fake EMAIL
+# binding, and a scripted fake fetch answering only api.anthropic.com for
+# the deferred-inbox-sweep case. Written to the repo root as
+# test-s62-schedule.mts, run, then deleted (git status clean afterward; not
+# in this step's touch list):
+NODE_OPTIONS=--experimental-sqlite npx tsx test-s62-schedule.mts
+  DONE-WHEN S6.2: the whole chain runs against real D1 without error
+  PASS poll ran for the one watched artist
+  PASS no artists deferred to tomorrow at this scale
+  PASS cluster created one tour for the pending event
+  PASS notify wrote one notification
+  PASS the payload build sees a pending digest for subscriber 1
+  PASS nothing was sent by the Worker itself (no digest compose/send here)
+  PASS second run creates no new tour (already clustered)
+  PASS second run writes no new notification (already notified)
+  DONE-WHEN S6.2: a seeded 40-hour-old pending notification triggers the fallback
+  PASS fallback digest sent for the stale subscriber
+  PASS the fallback digest was actually delivered via the mailer
+  PASS the notification is now marked sent
+  DONE-WHEN S6.2: a deferred inbox row is swept and answered
+  PASS one deferred row was swept
+  PASS the swept row was handled (a real conversation call, real reply)
+  PASS exactly one Anthropic call was made
+  PASS the inbox row is now handled
+  PASS a reply was actually sent
+  DONE-WHEN S6.2: the second-cron toggle defaults off and respects the env var
+  PASS primary cron always runs
+  PASS secondary cron does not run when the toggle is unset
+  PASS secondary cron runs when the toggle is set
+  PASS an unrecognised cron string still runs (safe default)
+
+20 passed, 0 failed
+```
+
+**Proposed commit message.**
+```
+Wire the daily cron: poll/cluster/notify/sweep/fallback in one run (S6.2)
+
+New src/core/schedule.ts's runDailySchedule is what src/index.ts's
+scheduled() now calls: the deterministic poll (S3.2) -> cluster
+(S3.3) -> notify (S3.3) -> reach/build-payload (S3.4/S4.1) chain
+against real D1, a sweep of any deferred inbox row through S6.1's
+live-reply path (closing handle.ts's own "from S5.1, not yet built"
+forward reference), and the two S4.8 safety nets (36h fallback
+digest, 30-day heartbeat) -- all in one invocation, capped and
+ordered (oldest-last-polled-first, oldest-deferred-first) so a
+busier future can't turn one bad day into an unbounded run.
+
+Cluster deliberately runs over every watched artist each day, not
+just the ones this run's own poll touched: tracing through
+src/mcp/server.ts showed that submit_sweep_results/submit_parsed_events
+(the dark-artist-sweep and tour-page-parse MCP tools the scheduled
+Claude task calls) leave events tour_id IS NULL exactly like a fresh
+poll does, but never cluster them -- and nothing else in the
+codebase does either. Restricting this stage to poll's own outcomes
+would have silently stranded every such discovery forever; a
+narrower equivalent gap remains in notify.ts's material_change
+trigger (its changedEventIds parameter has no way to discover an
+MCP-submitted change without a new D1 query), flagged in PROGRESS.md
+rather than fixed here since notify.ts is outside this step's touch
+list. Also adds a second-cron config toggle (ENABLE_SECOND_CRON,
+default off) with nothing yet to gate -- wrangler.jsonc still lists
+only the one 08:00 EET trigger; adding the 20:00 EET entry is a
+follow-up config change, not code. Verified end to end against a
+real D1 shim: the whole chain runs error-free, is idempotent on a
+second run, a 40-hour-old notification triggers the plain fallback
+digest, and a deferred inbox row gets a real live reply through the
+same path S6.1 wired up.
+```

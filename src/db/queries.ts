@@ -283,6 +283,23 @@ export async function getDistinctWatchedArtistIds(db: D1Database): Promise<numbe
 	return result.results.map((r) => r.artist_id);
 }
 
+/**
+ * S6.2: every currently-watched artist's full row, ordered oldest-polled
+ * first (`last_polled_at ASC` -- SQLite sorts `NULL` before any real value in
+ * ascending order, so a never-polled artist is always due before one polled
+ * at any timestamp). The daily cron uses this ordering to decide *which*
+ * artists to poll when a per-run cap defers the rest to tomorrow: capping a
+ * plain unordered list would let the same tail of artists starve every day,
+ * while this ordering rotates fairly -- whichever artists ran out of budget
+ * today are the least-recently-polled tomorrow, so they poll first.
+ */
+export async function getWatchedArtistsForPoll(db: D1Database): Promise<ArtistRow[]> {
+	const result = await db
+		.prepare(`SELECT * FROM artists WHERE id IN (SELECT DISTINCT artist_id FROM watchlist) ORDER BY last_polled_at ASC`)
+		.all<ArtistRow>();
+	return result.results;
+}
+
 /** Every subscriber watching one artist, with their priority — the S3.3 notification pass's fan-out. */
 export async function getWatchlistForArtist(db: D1Database, artistId: number): Promise<WatchlistRow[]> {
 	const result = await db.prepare(`SELECT * FROM watchlist WHERE artist_id = ?`).bind(artistId).all<WatchlistRow>();
@@ -726,6 +743,18 @@ export async function getPendingInboxMessages(db: D1Database): Promise<InboxRow[
 export async function getInboxRowById(db: D1Database, id: number): Promise<InboxRow | null> {
 	const result = await db.prepare(`SELECT * FROM inbox WHERE id = ?`).bind(id).first<InboxRow>();
 	return result ?? null;
+}
+
+/**
+ * S6.2: rows the live inbound path (S6.1) or an earlier live-attempt failure
+ * (S4.6's attempts-cap) left in `deferred` -- exactly the set DESIGN.md
+ * §12.4 says "picked up by the next scheduled run." Oldest first, so a
+ * per-run cap works through the backlog in arrival order rather than
+ * newest-first.
+ */
+export async function getDeferredInboxMessages(db: D1Database): Promise<InboxRow[]> {
+	const result = await db.prepare(`SELECT * FROM inbox WHERE status = 'deferred' ORDER BY received_at ASC`).all<InboxRow>();
+	return result.results;
 }
 
 export async function getInboxThread(db: D1Database, threadId: string): Promise<InboxRow[]> {
