@@ -334,7 +334,21 @@ async function handleAddArtists(input: AddArtistsInput, ctx: AgentToolContext): 
 const addArtistsTool: AgentToolDefinition<AddArtistsInput, AddArtistsOutput> = {
 	name: 'add_artists',
 	description:
-		'Adds many bands to the acting subscriber\'s watchlist in one call -- use this instead of calling add_artist repeatedly whenever the subscriber lists more than one or two bands at once (e.g. onboarding a whole list). Each band is resolved and its current tours fetched exactly as add_artist would, independently of the others, so one bad or ambiguous name never blocks the rest. Returns three groups: "resolved" (added, with a summary of what\'s already on for each), "ambiguous" (a name that matched more than one band -- each comes with a short did-you-mean question to relay to the subscriber), and "not_found" (a band that could not be processed, with a plain-text reason). A normal result often has entries in more than one group at once; that is not a failure.',
+		"Adds many bands to the acting subscriber's watchlist in one call -- use this instead of calling add_artist repeatedly whenever the " +
+		'subscriber lists more than one or two bands at once (e.g. onboarding a whole list, or a message that names several bands on one ' +
+		'line). Each band is resolved and its current tours fetched exactly as add_artist would, independently of the others, so one bad or ' +
+		'ambiguous name never blocks the rest. Before calling, read priority out of how each band was phrased, even when several bands with ' +
+		'different priorities appear in the same sentence: language like "my favourites are X and Y" or "I\'d fly anywhere for X" means the ' +
+		'highest priority (P1); "I\'d also go if it were easy" or "worth travelling for" is more moderate (P2); an offhand mention with no ' +
+		'stated enthusiasm, or a band named only regionally/locally, is lower (P3 or P4); when nothing in the phrasing signals either way, ' +
+		"leave priority unset and the default applies. Whatever reply summarises this call's results should say, in plain words, what " +
+		'priority was inferred for each band and invite a correction -- the subscriber did not type "P1", they typed a sentence, and this is ' +
+		'the only chance to check the inference was read the way they meant it. That reply should also carry the catch-up for anything ' +
+		"resolved: how many tours and dates are already on, and the closest reachable date if there is one -- this may be the subscriber's " +
+		'first real answer from the system, so it should feel like a substantive reply, not just an acknowledgement. Returns three groups: ' +
+		'"resolved" (added, with a summary of what\'s already on for each), "ambiguous" (a name that matched more than one band -- each ' +
+		'comes with a short did-you-mean question to relay to the subscriber), and "not_found" (a band that could not be processed, with a ' +
+		'plain-text reason). A normal result often has entries in more than one group at once; that is not a failure.',
 	input_schema: {
 		type: 'object',
 		properties: {
@@ -348,7 +362,10 @@ const addArtistsTool: AgentToolDefinition<AddArtistsInput, AddArtistsOutput> = {
 						priority: {
 							type: 'string',
 							enum: ['P1', 'P2', 'P3', 'P4'],
-							description: "Optional. Defaults to 'P3' if the subscriber didn't state one for this band.",
+							description:
+								'Optional. The priority inferred from how the subscriber phrased this particular band -- P1 for stated favourites or ' +
+								'"anywhere" enthusiasm, P2 for "worth travelling for", P3 for a casual/regional mention, P4 for local-only interest. ' +
+								'Leave unset when the wording gives no signal either way; P3 is applied automatically in that case.',
 						},
 					},
 					required: ['name'],

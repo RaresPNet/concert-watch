@@ -14,6 +14,7 @@
  */
 
 import {
+	getAllSourceHealth,
 	getAllSubscribers,
 	getArtistById,
 	getPendingNotificationsForSubscriber,
@@ -22,7 +23,7 @@ import {
 	getWatchlistForSubscriber,
 } from '../db/queries';
 import { attachReachabilityToTour } from '../core/reach';
-import type { NotificationRow, NotificationTrigger, Priority, ReachabilityTier } from '../db/schema';
+import type { NotificationRow, NotificationTrigger, Priority, ReachabilityTier, SourceHealthRow } from '../db/schema';
 import type { ContextualAffordance, DigestBuildResult, DigestEventSummary, DigestPayload, DigestTourBlock } from './payload.types';
 
 const TIER_SORT_RANK: Record<ReachabilityTier, number> = { A: 0, B: 1, C: 2, D: 3 };
@@ -196,4 +197,62 @@ export async function buildAllDigestPayloads(db: D1Database): Promise<DigestBuil
 		results.push(await buildDigestPayload(db, subscriber.id));
 	}
 	return results;
+}
+
+// ---------------------------------------------------------------------------
+// Source health (IMPLEMENTATION_PLAN.md S6.4, DESIGN.md §6.2's "record
+// consecutive failures per source in source_health; after three, add a
+// one-line warning at the bottom of the next digest").
+//
+// `source_health` is keyed globally by `source` string only (see
+// `src/db/schema.ts`'s `SourceHealthRow` and the write helpers around
+// `src/db/queries.ts`'s `recordSourceSuccess`/`recordSourceFailure`) -- there
+// is no per-artist failure tracking anywhere in the schema. S6.4's own plan
+// text asks for "a separate alert only if every source for a given artist
+// has been failing for a week," which cannot be computed from what the
+// schema actually records: doing so would need a per-(artist, source)
+// failure table and a migration, both outside this step's touch list (only
+// `payload.ts` and `fallback.ts`). The closest honest reading reachable from
+// the *global* `source_health` table alone: "every source" == every source
+// currently tracked in `source_health`, and "failing for a week" ==
+// currently failing (`consecutive_failures > 0`) with either no recorded
+// success at all (`last_ok_at IS NULL`) or a last success more than ~7 days
+// ago. Flagged in full in PROGRESS.md's S6.4 entry, not silently
+// reinterpreted.
+// ---------------------------------------------------------------------------
+
+/** DESIGN.md §6.2: "after three [consecutive failures], add a one-line warning." */
+const SOURCE_FAILURE_WARNING_THRESHOLD = 3;
+/** Approximates S6.4's "failing for a week" against the only timestamp `source_health` actually keeps (`last_ok_at`). */
+const ALL_SOURCES_FAILING_WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+
+export interface SourceHealthSummary {
+	/** Sources with >= 3 consecutive failures (DESIGN.md §6.2), in `source_health`'s own row order. Empty when nothing is struggling. */
+	strugglingSources: SourceHealthRow[];
+	/**
+	 * True when *every* row currently in `source_health` is both failing now
+	 * and has been for roughly a week — the global approximation of S6.4's
+	 * per-artist "every source has been failing for a week" described above.
+	 * False when `source_health` has no rows at all (nothing to alert on).
+	 */
+	allSourcesFailingForAWeek: boolean;
+}
+
+/** Parses D1's `datetime('now')` default shape ("YYYY-MM-DD HH:MM:SS", UTC, no `T`/`Z`) — same convention `fallback.ts` already established for comparing against `source_health.last_ok_at`. */
+function parseSqliteUtc(value: string): number {
+	return new Date(value.replace(' ', 'T') + 'Z').getTime();
+}
+
+/** Reads `source_health` and classifies it per DESIGN.md §6.2 / IMPLEMENTATION_PLAN.md S6.4. Pure D1 read, no model call, matching this file's own deterministic-core pattern. */
+export async function buildSourceHealthSummary(db: D1Database, now: Date = new Date()): Promise<SourceHealthSummary> {
+	const rows = await getAllSourceHealth(db);
+	const strugglingSources = rows.filter((r) => r.consecutive_failures >= SOURCE_FAILURE_WARNING_THRESHOLD);
+	const allSourcesFailingForAWeek =
+		rows.length > 0 &&
+		rows.every(
+			(r) =>
+				r.consecutive_failures > 0 &&
+				(r.last_ok_at === null || now.getTime() - parseSqliteUtc(r.last_ok_at) >= ALL_SOURCES_FAILING_WEEK_MS),
+		);
+	return { strugglingSources, allSourcesFailingForAWeek };
 }

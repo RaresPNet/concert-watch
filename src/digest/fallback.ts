@@ -57,7 +57,8 @@ import {
 } from '../db/queries';
 import type { SourceHealthRow, SubscriberRow } from '../db/schema';
 import type { Mailer } from '../mail/mailer';
-import { buildDigestPayload } from './payload';
+import { buildDigestPayload, buildSourceHealthSummary } from './payload';
+import type { SourceHealthSummary } from './payload';
 import type { DigestEventSummary, DigestPayload, DigestTourBlock } from './payload.types';
 
 const FALLBACK_THRESHOLD_MS = 36 * 60 * 60 * 1000;
@@ -80,6 +81,40 @@ function escapeHtml(input: string): string {
 
 const PLAIN_VERSION_NOTE =
 	"This is the plain version — the styled digest didn't go out in time, so here are the plain facts instead of waiting any longer.";
+
+/** "a" / "a and b" / "a, b, and c" — used only for the source-health warning line below. */
+function joinWithAnd(items: string[]): string {
+	if (items.length <= 1) return items.join('');
+	if (items.length === 2) return `${items[0]} and ${items[1]}`;
+	return `${items.slice(0, -1).join(', ')}, and ${items[items.length - 1]}`;
+}
+
+/**
+ * Source-health warning line(s) for the bottom of the digest (DESIGN.md §6.2 /
+ * IMPLEMENTATION_PLAN.md S6.4). Every string here is meant to stand on its
+ * own for a subscriber with no context on how this system is built — no
+ * internal source keys beyond a plain source name, no file/function/step
+ * references (per this step's own rule 5).
+ *
+ * Two tiers, most severe first:
+ * - every tracked source failing for roughly a week -> a stronger, standalone
+ *   alert line (this is the "Ticketmaster failing silently is now the worst
+ *   case" scenario DESIGN.md §6.2 calls out, generalised to "every source" —
+ *   see `payload.ts`'s `buildSourceHealthSummary` for the scoping caveat).
+ * - any source at >= 3 consecutive failures -> a lighter warning line.
+ * Both can't print at once; the alert subsumes the warning.
+ */
+function renderSourceHealthLines(summary: SourceHealthSummary): string[] {
+	if (summary.allSourcesFailingForAWeek) {
+		return [
+			"Every source this uses to find shows has been failing for about a week now — this digest may be missing shows entirely until that's fixed.",
+		];
+	}
+	if (summary.strugglingSources.length === 0) return [];
+	const names = joinWithAnd(summary.strugglingSources.map((s) => s.source));
+	const verb = summary.strugglingSources.length === 1 ? 'has' : 'have';
+	return [`Heads up: ${names} ${verb} been failing to load for a few days running — some shows might be missing until it's fixed.`];
+}
 
 function renderPlainEventText(ev: DigestEventSummary): string {
 	const place = [ev.venue_name, ev.city, ev.country].filter((p): p is string => !!p).join(', ');
@@ -106,10 +141,13 @@ function renderPlainTourText(tour: DigestTourBlock): string {
 }
 
 /** Plain-text body: the whole point of this file, so kept as the primary rendering; HTML below just wraps the same lines. */
-export function renderFallbackDigestText(payload: DigestPayload): string {
+export function renderFallbackDigestText(payload: DigestPayload, sourceHealth: SourceHealthSummary): string {
 	const greeting = payload.display_name ? `Hi ${payload.display_name},` : 'Hi,';
 	const body = payload.tours.length > 0 ? payload.tours.map(renderPlainTourText).join('\n\n') : 'Nothing pending.';
-	return [PLAIN_VERSION_NOTE, '', greeting, '', body].join('\n');
+	const warningLines = renderSourceHealthLines(sourceHealth);
+	const lines = [PLAIN_VERSION_NOTE, '', greeting, '', body];
+	if (warningLines.length > 0) lines.push('', ...warningLines);
+	return lines.join('\n');
 }
 
 function renderPlainEventHtml(ev: DigestEventSummary): string {
@@ -143,12 +181,17 @@ function renderPlainTourHtml(tour: DigestTourBlock): string {
 }
 
 /** Minimal HTML body -- tables only (§10.4), no images, no colour, no rotating copy. Same content as the text body. */
-export function renderFallbackDigestHtml(payload: DigestPayload): string {
+export function renderFallbackDigestHtml(payload: DigestPayload, sourceHealth: SourceHealthSummary): string {
 	const greeting = payload.display_name ? `Hi ${escapeHtml(payload.display_name)},` : 'Hi,';
 	const body =
 		payload.tours.length > 0
 			? `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">${payload.tours.map(renderPlainTourHtml).join('')}</table>`
 			: '<div>Nothing pending.</div>';
+	const warningLines = renderSourceHealthLines(sourceHealth);
+	const warningHtml =
+		warningLines.length > 0
+			? `<div style="margin-top:16px;color:#7a4a00;">${warningLines.map((line) => `<div>${escapeHtml(line)}</div>`).join('')}</div>`
+			: '';
 	return `<!doctype html>
 <html lang="en">
 <head><meta charset="utf-8" /><title>Concert watch -- plain digest</title></head>
@@ -156,6 +199,7 @@ export function renderFallbackDigestHtml(payload: DigestPayload): string {
 	<div style="font-style:italic;margin-bottom:12px;">${escapeHtml(PLAIN_VERSION_NOTE)}</div>
 	<div>${greeting}</div>
 	${body}
+	${warningHtml}
 </body>
 </html>`;
 }
@@ -184,8 +228,9 @@ async function sendFallbackDigestForSubscriber(
 	const subscriber = await getSubscriberById(db, subscriberId);
 	if (!subscriber) return { subscriber_id: subscriberId, sent: false, reason: 'subscriber_not_found' };
 
-	const html = renderFallbackDigestHtml(built.payload);
-	const text = renderFallbackDigestText(built.payload);
+	const sourceHealth = await buildSourceHealthSummary(db, now);
+	const html = renderFallbackDigestHtml(built.payload, sourceHealth);
+	const text = renderFallbackDigestText(built.payload, sourceHealth);
 
 	try {
 		await mailer.send({ to: subscriber.email, subject: 'Concert watch (plain digest)', html, text });
