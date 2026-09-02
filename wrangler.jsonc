@@ -8,30 +8,35 @@
 	"main": "src/index.ts",
 	"compatibility_date": "2026-08-25",
 	"observability": {
-		"enabled": true
+		"enabled": true,
 	},
 	"triggers": {
-		"crons": ["0 5 * * *"]
+		"crons": ["0 5 * * *"],
 	},
 	"upload_source_maps": true,
 	"d1_databases": [
-    {
-        "binding": "DB",
-        "database_name": "concert-watch",
-        "database_id": "f80af4e3-a05b-458a-873c-f2ed330483ed"
-    }
+		{
+			"binding": "DB",
+			"database_name": "concert-watch",
+			"database_id": "f80af4e3-a05b-458a-873c-f2ed330483ed",
+		},
 	],
 	"r2_buckets": [
 		{
 			"binding": "IMAGES",
-			"bucket_name": "concert-watch-images"
-		}
+			"bucket_name": "concert-watch-images",
+		},
 	],
 	"send_email": [
 		{
-			"name": "EMAIL"
-		}
-	]
+			"name": "EMAIL",
+		},
+	],
+	// S4.4: configurable monthly spend ceiling for the reply path
+	// (DESIGN.md §12.5). See src/model/budget.ts for the default/rationale.
+	"vars": {
+		"MODEL_MONTHLY_CEILING_USD": "8",
+	},
 	/**
 	 * Smart Placement
 	 * https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement

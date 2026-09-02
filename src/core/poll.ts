@@ -27,6 +27,7 @@ import {
 	touchArtistPolled,
 	updateArtistTourPageHash,
 	upsertEventByFingerprint,
+	upsertPendingPageParse,
 } from '../db/queries';
 import type { ArtistRow } from '../db/schema';
 import { checkTourPage } from '../sources/tourpage';
@@ -73,8 +74,15 @@ function toArtistRef(artist: ArtistRow): SourceArtistRef {
 	};
 }
 
-/** Persists one `RawSourceEvent`, comparing against any prior row by fingerprint to classify inserted/changed/unchanged. */
-async function persistRawEvent(db: D1Database, raw: RawSourceEvent, artist: ArtistRow): Promise<PollEventOutcome> {
+/**
+ * Persists one `RawSourceEvent`, comparing against any prior row by
+ * fingerprint to classify inserted/changed/unchanged. Exported (S4.7): the
+ * MCP endpoint's `submit_sweep_results`/`submit_parsed_events` tools reuse
+ * this directly rather than re-implementing the same normalise-then-upsert-
+ * then-classify sequence for model-submitted events -- see PROGRESS.md's
+ * S4.7 entry.
+ */
+export async function persistRawEvent(db: D1Database, raw: RawSourceEvent, artist: ArtistRow): Promise<PollEventOutcome> {
 	const result = await normaliseEvent(raw, { id: artist.id, mbid: artist.mbid });
 	if (!result.ok) {
 		// Quarantined, not dropped (DESIGN.md §4) — the caller is left to decide
@@ -128,11 +136,18 @@ async function pollOneArtist(artist: ArtistRow, deps: PollDeps, nowIso: string):
 				break;
 			case 'needs_model_parse':
 				// Store the fresh hash so this same unchanged-but-unparsed page
-				// isn't re-flagged every day — but the HTML itself isn't
-				// persisted anywhere by this step; a later step (S4.7's
-				// get_unparsed_pages / a dedicated table) owns queuing it for a
-				// model parse. Flagged in PROGRESS.md.
+				// isn't re-flagged every day, and durably queue the page for a
+				// model parse (S4.7's `pending_page_parses` table / MCP
+				// `get_unparsed_pages`/`submit_parsed_events` tools) -- this was
+				// previously a flagged gap (see PROGRESS.md's S3.2 entry); S4.7
+				// closes it with this one additive call.
 				await updateArtistTourPageHash(deps.db, artist.id, result.hash);
+				await upsertPendingPageParse(deps.db, {
+					artist_id: artist.id,
+					tour_url: artist.tour_url ?? '',
+					html: result.html,
+					hash: result.hash,
+				});
 				needsModelParse = true;
 				break;
 			case 'fetch_failed':

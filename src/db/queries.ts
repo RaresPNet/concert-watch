@@ -22,8 +22,10 @@ import type {
 	NotificationRow,
 	NotificationTrigger,
 	OriginRow,
+	PendingPageParseRow,
 	Priority,
 	ReachabilityRow,
+	SentReplyRow,
 	SourceHealthRow,
 	SubscriberRow,
 	SubscriberStatus,
@@ -56,8 +58,19 @@ export async function getSubscriberByEmail(db: D1Database, email: string): Promi
 	return db.prepare(`SELECT * FROM subscribers WHERE email = ?`).bind(email).first<SubscriberRow>();
 }
 
+/** Every subscriber row — S4.1's digest run iterates this to decide who gets a payload built. */
+export async function getAllSubscribers(db: D1Database): Promise<SubscriberRow[]> {
+	const result = await db.prepare(`SELECT * FROM subscribers ORDER BY id ASC`).all<SubscriberRow>();
+	return result.results;
+}
+
 export async function setSubscriberVerifiedAt(db: D1Database, id: number, verifiedAt: string): Promise<void> {
 	await db.prepare(`UPDATE subscribers SET verified_at = ? WHERE id = ?`).bind(verifiedAt, id).run();
+}
+
+/** S4.8: records that the 30-day heartbeat fired for this subscriber, so `runHeartbeatCheck` doesn't refire it every day thereafter. */
+export async function setSubscriberLastHeartbeatAt(db: D1Database, id: number, at: string): Promise<void> {
+	await db.prepare(`UPDATE subscribers SET last_heartbeat_at = ? WHERE id = ?`).bind(at, id).run();
 }
 
 export async function appendSubscriberPreference(db: D1Database, id: number, note: string): Promise<void> {
@@ -140,6 +153,16 @@ export async function updateArtistTourPageHash(db: D1Database, id: number, hash:
 	await db.prepare(`UPDATE artists SET tour_page_hash = ? WHERE id = ?`).bind(hash, id).run();
 }
 
+/** S4.3: records the R2 key once an artist's image has been fetched and cached. */
+export async function updateArtistImageKey(db: D1Database, id: number, r2Key: string): Promise<void> {
+	await db.prepare(`UPDATE artists SET image_url = ? WHERE id = ?`).bind(r2Key, id).run();
+}
+
+/** S4.3: records the R2 key once an artist's logo has been fetched and cached. */
+export async function updateArtistLogoKey(db: D1Database, id: number, r2Key: string): Promise<void> {
+	await db.prepare(`UPDATE artists SET logo_url = ? WHERE id = ?`).bind(r2Key, id).run();
+}
+
 // ---------------------------------------------------------------------------
 // watchlist
 // ---------------------------------------------------------------------------
@@ -160,6 +183,88 @@ export async function addToWatchlist(
 export async function getWatchlistForSubscriber(db: D1Database, subscriberId: number): Promise<WatchlistRow[]> {
 	const result = await db.prepare(`SELECT * FROM watchlist WHERE subscriber_id = ?`).bind(subscriberId).all<WatchlistRow>();
 	return result.results;
+}
+
+/**
+ * S4.5: the single (subscriber, artist) watchlist row, or null if that
+ * subscriber does not watch that artist. This is the ownership-check
+ * primitive `src/agent/tools.ts` calls before letting a tool touch an
+ * artist row on a subscriber's behalf -- a subscriber must not be able to
+ * affect or read another subscriber's watchlist entry through a crafted
+ * tool call (DESIGN.md §11.1's "data, not instructions" principle extends
+ * to tool arguments, not just email bodies).
+ */
+export async function getWatchlistEntry(db: D1Database, subscriberId: number, artistId: number): Promise<WatchlistRow | null> {
+	return db.prepare(`SELECT * FROM watchlist WHERE subscriber_id = ? AND artist_id = ?`).bind(subscriberId, artistId).first<WatchlistRow>();
+}
+
+/**
+ * S4.5: case-insensitive artist name lookup scoped to one subscriber's own
+ * watchlist (a join, not a global `artists` search) -- so `get_tour`'s
+ * free-text path can never resolve to, or leak the existence of, an artist
+ * the acting subscriber doesn't watch. Matches on exact name or a
+ * substring, preferring an exact match when both exist.
+ */
+export async function findWatchedArtistByName(db: D1Database, subscriberId: number, name: string): Promise<ArtistRow | null> {
+	const needle = name.trim().toLowerCase();
+	if (!needle) return null;
+	const result = await db
+		.prepare(
+			`SELECT a.* FROM artists a
+       JOIN watchlist w ON w.artist_id = a.id
+       WHERE w.subscriber_id = ? AND LOWER(a.name) LIKE ?
+       ORDER BY (LOWER(a.name) = ?) DESC, a.name ASC
+       LIMIT 1`,
+		)
+		.bind(subscriberId, `%${needle}%`, needle)
+		.first<ArtistRow>();
+	return result;
+}
+
+/**
+ * S4.5: every artist a subscriber watches, artist row plus its own
+ * priority -- the shape `list_watchlist` needs (names and priorities,
+ * nothing else per DESIGN.md §11.5) without a second round trip per row.
+ */
+export async function getWatchlistWithArtists(
+	db: D1Database,
+	subscriberId: number,
+): Promise<Array<{ artist_id: number; name: string; priority: Priority }>> {
+	const result = await db
+		.prepare(
+			`SELECT a.id AS artist_id, a.name AS name, w.priority AS priority
+       FROM watchlist w
+       JOIN artists a ON a.id = w.artist_id
+       WHERE w.subscriber_id = ?
+       ORDER BY a.name ASC`,
+		)
+		.bind(subscriberId)
+		.all<{ artist_id: number; name: string; priority: Priority }>();
+	return result.results;
+}
+
+/**
+ * S4.5: removes one (subscriber, artist) watchlist row. Returns whether a
+ * row actually existed to remove -- the caller (`remove_artist`) uses this
+ * as its ownership check rather than doing a separate `getWatchlistEntry`
+ * read first, since D1's `meta.changes` already tells us.
+ */
+export async function removeFromWatchlist(db: D1Database, subscriberId: number, artistId: number): Promise<boolean> {
+	const result = await db.prepare(`DELETE FROM watchlist WHERE subscriber_id = ? AND artist_id = ?`).bind(subscriberId, artistId).run();
+	return (result.meta?.changes ?? 0) > 0;
+}
+
+/**
+ * S4.5: updates the priority on one (subscriber, artist) watchlist row.
+ * Returns whether a row existed to update, for the same ownership-check
+ * reason as `removeFromWatchlist`.
+ */
+export async function setWatchlistPriority(db: D1Database, subscriberId: number, artistId: number, priority: Priority): Promise<boolean> {
+	const result = await db
+		.prepare(`UPDATE watchlist SET priority = ? WHERE subscriber_id = ? AND artist_id = ?`)
+		.bind(priority, subscriberId, artistId)
+		.run();
+	return (result.meta?.changes ?? 0) > 0;
 }
 
 /** The daily poll set: every artist watched by at least one subscriber (DESIGN.md §4). */
@@ -231,6 +336,21 @@ export async function getOpenTourForArtist(db: D1Database, artistId: number, tod
 		)
 		.bind(artistId, todayIso)
 		.first<TourRow>();
+}
+
+/**
+ * S4.5: every tour ever created for one artist, most recent first --
+ * `get_tour`'s handle-resolution path needs every tour (not just the
+ * currently-"open" one from `getOpenTourForArtist`) so a handle referencing
+ * a band's earlier tour still resolves, and so it can reproduce
+ * `payload.ts`'s `makeHandle` formula against each candidate.
+ */
+export async function getToursForArtist(db: D1Database, artistId: number): Promise<TourRow[]> {
+	const result = await db
+		.prepare(`SELECT * FROM tours WHERE artist_id = ? ORDER BY created_at DESC, id DESC`)
+		.bind(artistId)
+		.all<TourRow>();
+	return result.results;
 }
 
 export async function updateTourSummary(
@@ -419,6 +539,24 @@ export async function getNotificationsForTour(db: D1Database, tourId: number): P
 	return result.results;
 }
 
+/** Every not-yet-delivered notification for one subscriber — S4.1's digest payload builder groups these by tour_id into blocks. */
+export async function getPendingNotificationsForSubscriber(db: D1Database, subscriberId: number): Promise<NotificationRow[]> {
+	const result = await db
+		.prepare(`SELECT * FROM notifications WHERE subscriber_id = ? AND sent_at IS NULL ORDER BY id ASC`)
+		.bind(subscriberId)
+		.all<NotificationRow>();
+	return result.results;
+}
+
+/** S4.8: the most recent `sent_at` across every delivered notification for one subscriber, or null if none has ever been delivered. Feeds the 30-day heartbeat's "nothing sent" check. */
+export async function getLastSentAtForSubscriber(db: D1Database, subscriberId: number): Promise<string | null> {
+	const row = await db
+		.prepare(`SELECT MAX(sent_at) AS last_sent_at FROM notifications WHERE subscriber_id = ? AND sent_at IS NOT NULL`)
+		.bind(subscriberId)
+		.first<{ last_sent_at: string | null }>();
+	return row?.last_sent_at ?? null;
+}
+
 // ---------------------------------------------------------------------------
 // reachability / origins
 // ---------------------------------------------------------------------------
@@ -440,6 +578,22 @@ export async function upsertReachability(
 
 export async function getReachability(db: D1Database, cityKey: string): Promise<ReachabilityRow[]> {
 	const result = await db.prepare(`SELECT * FROM reachability WHERE city_key = ?`).bind(cityKey).all<ReachabilityRow>();
+	return result.results;
+}
+
+/**
+ * S4.5: `get_reachability(city)`'s lookup when the model's free-text city
+ * doesn't match a `city_key` exactly. `city_key` is `"<country>:<city>"`
+ * (DESIGN.md §4, e.g. `"gb:leeds"`) with no punctuation in the city part,
+ * so this does a suffix match against a slugified query (lowercased,
+ * non-alphanumeric stripped) -- `"Leeds"` and `"leeds"` both become `%:leeds`
+ * and match `gb:leeds` without needing the country.
+ */
+export async function getReachabilityByCitySlug(db: D1Database, citySlug: string): Promise<ReachabilityRow[]> {
+	const result = await db
+		.prepare(`SELECT * FROM reachability WHERE city_key LIKE ? ESCAPE '\\'`)
+		.bind(`%:${citySlug.replace(/[%_\\]/g, '\\$&')}`)
+		.all<ReachabilityRow>();
 	return result.results;
 }
 
@@ -537,6 +691,79 @@ export async function incrementInboxAttempts(db: D1Database, id: number): Promis
 	return result.attempts;
 }
 
+/**
+ * S4.6: marks a row `deferred` without stamping `handled_at` -- unlike
+ * `markInboxHandled`, a deferred row is explicitly NOT done; it is waiting
+ * for a later, different code path (a cron sweep, or eventually a
+ * scheduled-task/app-quota pass) to pick it up. Used for both retry-storm
+ * exhaustion (§12.4: 2 failed live attempts) and monthly-budget degrade
+ * (§12.5) -- see `src/mail/handle.ts` for which is which. This is the
+ * "combined insert-with-note helper" gap S1.4's own PROGRESS.md entry
+ * flagged as worth adding alongside S4.6's needs; kept narrow (just the
+ * UPDATE) rather than folding insert and note-setting into one function,
+ * since S1.4's own inbound.ts is outside this step's touch list.
+ */
+export async function markInboxDeferred(db: D1Database, id: number, resultNote: string): Promise<void> {
+	await db.prepare(`UPDATE inbox SET status = 'deferred', result_note = ? WHERE id = ?`).bind(resultNote, id).run();
+}
+
+// ---------------------------------------------------------------------------
+// sent_replies (migrations/0005_sent_replies.sql, S4.6)
+// ---------------------------------------------------------------------------
+
+/**
+ * Persists one reply the inbound command handler actually sent (only ever
+ * called after the mailer confirms delivery -- DESIGN.md §9.3's "don't mark
+ * success until delivery confirms" discipline). Returns the new row's id.
+ */
+export async function insertSentReply(
+	db: D1Database,
+	input: {
+		inbox_id: number;
+		subscriber_id: number;
+		thread_id: string;
+		message_id: string;
+		in_reply_to?: string | null;
+		references?: string | null;
+		body_text: string;
+	},
+): Promise<number> {
+	const result = await db
+		.prepare(
+			`INSERT INTO sent_replies (inbox_id, subscriber_id, thread_id, message_id, in_reply_to, "references", body_text)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       RETURNING id`,
+		)
+		.bind(
+			input.inbox_id,
+			input.subscriber_id,
+			input.thread_id,
+			input.message_id,
+			input.in_reply_to ?? null,
+			input.references ?? null,
+			input.body_text,
+		)
+		.first<{ id: number }>();
+	if (!result) throw new Error('insertSentReply: insert did not return an id');
+	return result.id;
+}
+
+/**
+ * Every reply sent so far in one thread, oldest first -- the "assistant"
+ * half of the conversation `src/mail/conversation.ts` interleaves with
+ * `getInboxThread`'s "user" half to reconstruct the whole exchange before
+ * calling the model (DESIGN.md §11.2: "a reply loads its whole thread...
+ * so the model sees real context rather than whatever the client happened
+ * to quote").
+ */
+export async function getSentRepliesForThread(db: D1Database, threadId: string): Promise<SentReplyRow[]> {
+	const result = await db
+		.prepare(`SELECT * FROM sent_replies WHERE thread_id = ? ORDER BY sent_at ASC, id ASC`)
+		.bind(threadId)
+		.all<SentReplyRow>();
+	return result.results;
+}
+
 // ---------------------------------------------------------------------------
 // source_health
 // ---------------------------------------------------------------------------
@@ -602,6 +829,20 @@ export async function getUsageForMonth(db: D1Database, yyyyMm: string): Promise<
 	return result.results;
 }
 
+/**
+ * S4.8: cumulative spend across every `usage` row ever written, for the
+ * 30-day heartbeat's "spend to date" line (DESIGN.md §10.3) -- deliberately
+ * all-time, not month-to-date like `budget.ts`'s `getBudgetStatus` (S4.4),
+ * since "spend to date" reads as the running total rather than resetting
+ * each month. S4.4's `budget.ts` only exposes a month-scoped helper; if it
+ * later grows an all-time one, this is a natural place to switch to it
+ * instead of querying `usage` directly.
+ */
+export async function getTotalSpend(db: D1Database): Promise<number> {
+	const row = await db.prepare(`SELECT COALESCE(SUM(est_cost), 0) AS total FROM usage`).first<{ total: number }>();
+	return row?.total ?? 0;
+}
+
 // ---------------------------------------------------------------------------
 // rate_limit
 // ---------------------------------------------------------------------------
@@ -629,4 +870,53 @@ export async function getRateLimitCount(db: D1Database, sender: string, hourBuck
 		.bind(sender, hourBucket)
 		.first<{ count: number }>();
 	return row?.count ?? 0;
+}
+
+// ---------------------------------------------------------------------------
+// S4.7 additions -- MCP endpoint (src/mcp/server.ts)
+// ---------------------------------------------------------------------------
+
+/** Every `dark`-coverage artist -- S4.7's `get_sweep_targets` MCP tool. Per DESIGN.md §6.3, "every artist is polled every day" at this scale, so this is every dark artist, unfiltered by `last_polled_at` (no rotation, per §6.3/§15's explicit deferral). */
+export async function getDarkArtists(db: D1Database): Promise<ArtistRow[]> {
+	const result = await db.prepare(`SELECT * FROM artists WHERE coverage = 'dark' ORDER BY id ASC`).all<ArtistRow>();
+	return result.results;
+}
+
+/** Count of `notifications` rows not yet delivered, across every subscriber -- one of S4.7's `status()` pending counts. */
+export async function countPendingNotifications(db: D1Database): Promise<number> {
+	const row = await db.prepare(`SELECT COUNT(*) AS n FROM notifications WHERE sent_at IS NULL`).first<{ n: number }>();
+	return row?.n ?? 0;
+}
+
+// ---------------------------------------------------------------------------
+// pending_page_parses (migrations/0003_pending_page_parses.sql, S4.7)
+// ---------------------------------------------------------------------------
+
+export async function upsertPendingPageParse(
+	db: D1Database,
+	input: { artist_id: number; tour_url: string; html: string; hash: string },
+): Promise<void> {
+	await db
+		.prepare(
+			`INSERT INTO pending_page_parses (artist_id, tour_url, html, hash, queued_at)
+       VALUES (?, ?, ?, ?, datetime('now'))
+       ON CONFLICT (artist_id) DO UPDATE SET
+         tour_url = excluded.tour_url, html = excluded.html, hash = excluded.hash, queued_at = excluded.queued_at`,
+		)
+		.bind(input.artist_id, input.tour_url, input.html, input.hash)
+		.run();
+}
+
+export async function getAllPendingPageParses(db: D1Database): Promise<PendingPageParseRow[]> {
+	const result = await db.prepare(`SELECT * FROM pending_page_parses ORDER BY queued_at ASC`).all<PendingPageParseRow>();
+	return result.results;
+}
+
+export async function getPendingPageParse(db: D1Database, artistId: number): Promise<PendingPageParseRow | null> {
+	return db.prepare(`SELECT * FROM pending_page_parses WHERE artist_id = ?`).bind(artistId).first<PendingPageParseRow>();
+}
+
+/** Idempotent by construction -- deleting a row that's already gone (a repeat `submit_parsed_events` call) is a no-op, not an error. */
+export async function deletePendingPageParse(db: D1Database, artistId: number): Promise<void> {
+	await db.prepare(`DELETE FROM pending_page_parses WHERE artist_id = ?`).bind(artistId).run();
 }

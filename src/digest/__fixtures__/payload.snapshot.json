@@ -1,0 +1,193 @@
+{
+	"subscriber_id": 1,
+	"email": "paula@example.com",
+	"display_name": "Paula",
+	"tours": [
+		{
+			"tour_id": 1,
+			"artist_id": 1,
+			"artist_name": "IDLES",
+			"artist_image_url": null,
+			"label": "IDLES European Tour 2026",
+			"official_url": "https://idles.example/tour",
+			"date_count": 3,
+			"first_date": "2026-11-01",
+			"last_date": "2026-11-10",
+			"top_dates": [
+				{
+					"event_id": 1,
+					"starts_at": "2026-11-01T19:00:00Z",
+					"city": "Leeds",
+					"country": "GB",
+					"venue_name": "O2 Academy Leeds",
+					"tier": "A",
+					"route_note": "direct CLJ->LBA, Wizz, Tue/Sat",
+					"onsale_at": null,
+					"presale_at": null,
+					"ticket_url": null
+				},
+				{
+					"event_id": 3,
+					"starts_at": "2026-11-10T19:00:00Z",
+					"city": "London",
+					"country": "GB",
+					"venue_name": "O2 Academy Brixton",
+					"tier": "B",
+					"route_note": "direct CLJ->LTN, then train",
+					"onsale_at": null,
+					"presale_at": null,
+					"ticket_url": null
+				},
+				{
+					"event_id": 2,
+					"starts_at": "2026-11-05T19:00:00Z",
+					"city": "Bucharest",
+					"country": "RO",
+					"venue_name": "Arenele Romane",
+					"tier": null,
+					"route_note": null,
+					"onsale_at": null,
+					"presale_at": null,
+					"ticket_url": null
+				}
+			],
+			"handle": "#I01",
+			"triggers": ["new_tour"],
+			"notification_ids": [1],
+			"more_dates_expected": false,
+			"affordance": "trip_help"
+		},
+		{
+			"tour_id": 3,
+			"artist_id": 2,
+			"artist_name": "Aurora",
+			"artist_image_url": null,
+			"label": "Aurora Live",
+			"official_url": "https://aurora.example/tour",
+			"date_count": 1,
+			"first_date": "2026-11-15",
+			"last_date": "2026-11-15",
+			"top_dates": [
+				{
+					"event_id": 5,
+					"starts_at": "2026-11-15T19:00:00Z",
+					"city": "London",
+					"country": "GB",
+					"venue_name": "Roundhouse",
+					"tier": "B",
+					"route_note": "direct CLJ->LTN, then train",
+					"onsale_at": null,
+					"presale_at": null,
+					"ticket_url": null
+				}
+			],
+			"handle": null,
+			"triggers": ["new_tour"],
+			"notification_ids": [3],
+			"more_dates_expected": false,
+			"affordance": "trip_help"
+		},
+		{
+			"tour_id": 2,
+			"artist_id": 1,
+			"artist_name": "IDLES",
+			"artist_image_url": null,
+			"label": "IDLES Winter Run",
+			"official_url": "https://idles.example/winter",
+			"date_count": 1,
+			"first_date": "2026-12-01",
+			"last_date": "2026-12-01",
+			"top_dates": [
+				{
+					"event_id": 4,
+					"starts_at": "2026-12-01T19:00:00Z",
+					"city": "Berlin",
+					"country": "DE",
+					"venue_name": "Columbiahalle",
+					"tier": "B",
+					"route_note": "direct CLJ->BER, Wizz",
+					"onsale_at": "2026-09-10T09:00:00Z",
+					"presale_at": null,
+					"ticket_url": null
+				}
+			],
+			"handle": "#I02",
+			"triggers": ["new_tour"],
+			"notification_ids": [2],
+			"more_dates_expected": false,
+			"affordance": "onsale_nudge"
+		},
+		{
+			"tour_id": 4,
+			"artist_id": 3,
+			"artist_name": "Requiem",
+			"artist_image_url": null,
+			"label": "Requiem Tour",
+			"official_url": null,
+			"date_count": 1,
+			"first_date": "2026-10-20",
+			"last_date": "2026-10-20",
+			"top_dates": [
+				{
+					"event_id": 6,
+					"starts_at": "2026-10-20T19:00:00Z",
+					"city": "Paris",
+					"country": "FR",
+					"venue_name": "Le Zenith",
+					"tier": "D",
+					"route_note": "no direct, connections only",
+					"onsale_at": null,
+					"presale_at": null,
+					"ticket_url": null
+				}
+			],
+			"handle": null,
+			"triggers": ["new_dates"],
+			"notification_ids": [4],
+			"more_dates_expected": false,
+			"affordance": "awkward_p1"
+		},
+		{
+			"tour_id": 5,
+			"artist_id": 4,
+			"artist_name": "Multiband",
+			"artist_image_url": null,
+			"label": "Multiband Tour",
+			"official_url": "https://multiband.example/tour",
+			"date_count": 2,
+			"first_date": "2026-09-20",
+			"last_date": "2026-09-25",
+			"top_dates": [
+				{
+					"event_id": 7,
+					"starts_at": "2026-09-20T19:00:00Z",
+					"city": "Milan",
+					"country": "IT",
+					"venue_name": "Alcatraz",
+					"tier": null,
+					"route_note": null,
+					"onsale_at": null,
+					"presale_at": null,
+					"ticket_url": null
+				},
+				{
+					"event_id": 8,
+					"starts_at": "2026-09-25T19:00:00Z",
+					"city": "Madrid",
+					"country": "ES",
+					"venue_name": "La Riviera",
+					"tier": null,
+					"route_note": null,
+					"onsale_at": null,
+					"presale_at": null,
+					"ticket_url": null
+				}
+			],
+			"handle": null,
+			"triggers": ["new_tour"],
+			"notification_ids": [5],
+			"more_dates_expected": false,
+			"affordance": "multi_date_ask"
+		}
+	]
+}

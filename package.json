@@ -1,16 +1,20 @@
 {
-  "name": "concert-watch",
-  "version": "0.0.0",
-  "private": true,
-  "scripts": {
-    "deploy": "wrangler deploy",
-    "dev": "wrangler dev --test-scheduled",
-    "start": "wrangler dev --test-scheduled",
-    "cf-typegen": "wrangler types"
-  },
-  "devDependencies": {
-    "@types/node": "^26.4.0",
-    "typescript": "^5.5.2",
-    "wrangler": "^4.127.1"
-  }
+	"name": "concert-watch",
+	"version": "0.0.0",
+	"private": true,
+	"scripts": {
+		"deploy": "wrangler deploy",
+		"dev": "wrangler dev --test-scheduled",
+		"start": "wrangler dev --test-scheduled",
+		"cf-typegen": "wrangler types"
+	},
+	"devDependencies": {
+		"@types/node": "^26.4.0",
+		"typescript": "^5.5.2",
+		"wrangler": "^4.127.1"
+	},
+	"dependencies": {
+		"@modelcontextprotocol/server": "^2.0.0",
+		"zod": "^4.5.4"
+	}
 }

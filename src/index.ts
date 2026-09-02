@@ -17,6 +17,7 @@
 
 import { emailHandler } from './mail/inbound';
 import { resolveArtist } from './core/resolve';
+import { routeMcpRequest } from './mcp/server';
 
 export default {
 	// S1.4: inbound mail capture. Logic lives in src/mail/inbound.ts; this is
@@ -25,6 +26,15 @@ export default {
 	email: emailHandler,
 
 	async fetch(req, env) {
+		// S4.7: MCP endpoint. `env` is cast the same way the existing
+		// `/__test-resolve` route below already casts it for
+		// ANTHROPIC_API_KEY/TICKETMASTER_API_KEY -- MCP_AUTH_TOKEN is a plain
+		// wrangler secret, not a declared binding, so it has no entry in the
+		// generated `Env` type. Returns `null` (falls through to the routes
+		// below) for anything outside `/mcp/`.
+		const mcpResponse = await routeMcpRequest(req, env as any);
+		if (mcpResponse) return mcpResponse;
+
 		const url = new URL(req.url);
 
 		if (url.pathname === '/__test-resolve') {

@@ -1,8 +1,11 @@
-# IMPLEMENTATION_PLAN.md — Concert Alerts
+# IMPLEMENTATION_PLAN.md — concert-watch
 
 Companion to `DESIGN.md`, which is the contract. Where this plan and the design
 disagree, the design wins; raise the conflict in `PROGRESS.md` rather than
 resolving it silently.
+
+**Status: Phases 0–4 complete.** Phase 5 revises what's built; Phase 6
+assembles it into a running system.
 
 ## How to use this
 
@@ -21,546 +24,394 @@ Rules for every step:
    another step's entry.
 4. Do not write tests beyond what the step asks for. Test budget is
    deliberately small.
+5. **Anything a model reads at runtime — MCP tool descriptions, agent tool
+   descriptions, input schema field descriptions, system prompts, skill
+   text — must make sense to a reader who has never seen this repository.** No
+   step numbers, no `DESIGN.md` section references, no function names, no file
+   paths. The model consuming these has none of that context and will be
+   confused by it, not helped. Write what the thing does and when to use it, in
+   plain language. This rule has already been violated once, and it's easy to
+   violate by accident: the writing agent *has* the context and forgets the
+   reader doesn't.
 
 **Legend** — `[R]` Rareș does this by hand · `[A]` agentic step ·
 `∥` marks steps that can run in parallel with each other.
 
 ---
 
-## Phase 0 — Platform setup `[R]`
+## Phases 0–4 — complete
 
-Nothing can start until these exist. All manual.
+Summarised for orientation only. Full detail, assumptions and known gaps are in
+`PROGRESS.md`; read that rather than trusting this table to be complete.
 
-### S0.1 `[R]` Repo and Worker skeleton
-
-- Git repo with `DESIGN.md`, `IMPLEMENTATION_PLAN.md`, empty `PROGRESS.md`.
-- `wrangler` project, TypeScript, deploys a hello-world Worker.
-- Bindings declared: D1 (`DB`), R2 (`IMAGES`), Email Service, cron trigger at
-  `0 5 * * *` UTC (08:00 EET).
-
-### S0.2 `[R]` Domain and mail
-
-- Domain on Cloudflare, Email Routing enabled.
-- Catch-all or specific address routed to the Worker.
-- Cloudflare Email Service enabled; DNS/DKIM records in place.
-- **Verify both personal addresses as Email Routing destinations.** Each owner
-  clicks a confirmation link. Sending is free on the Workers Free plan only to
-  verified destinations (§3) — without this step nothing sends.
-- Verify a hello-world send lands in a real inbox and isn't marked spam.
-- Confirm the account stays on the Workers Free plan. Do not upgrade
-  preemptively; §3.1 names the one symptom that would justify it.
-
-### S0.3 `[R]` Credentials
-
-- Ticketmaster Discovery API key (free, self-serve).
-- Send the Bandsintown access request to `biz@bandsintown.com`. Do not block
-  on it; the adapter ships disabled (§6.2).
-- Apply for a Songkick API key. Same — don't block on it.
-- Anthropic API key, with a **billing alert and a hard spend cap set in the
-  console**. Belt and braces alongside the in-app ceiling of §12.4.
-- Secrets stored via `wrangler secret`, never committed.
-
-**Done when:** a deployed Worker can be pinged, can query D1, can send one
-email, and receives mail sent to the address.
-
----
-
-## Phase 1 — Foundations
-
-All four are `∥` parallel with each other once Phase 0 is done. They share no
-files.
-
-### S1.1 `[A]` `∥` D1 schema and migrations
-
-**Goal.** Every table in `DESIGN.md` §4, as numbered migration files, plus a
-tiny typed query layer.
-
-**Touches.** `migrations/`, `src/db/schema.ts`, `src/db/queries.ts`
-
-**Notes.**
-- Add the `preferences` free-text column and `verified_at` on `subscribers`
-  (§3, §11.3), and the `message_id` / `in_reply_to` / `references` /
-  `thread_id` columns on `inbox` (§11.2) — all in the design but easy to miss
-  from §4 alone.
-- Add a `source_health` table: `source`, `consecutive_failures`,
-  `last_ok_at`, `last_error` (§6.2).
-- Add a `usage` table: `day`, `path`, `model`, `input_tokens`,
-  `output_tokens`, `est_cost` (§12.4), and `inbox.attempts` (§12.3).
-- Add a `rate_limit` table or KV equivalent keyed on sender + hour (§12.3).
-- Index `events.fingerprint`, `events.tour_id`, `watchlist.artist_id`,
-  `inbox.status`, `inbox.thread_id`.
-
-**Done when.** Migrations apply cleanly to a local D1 and to remote; a seed
-script inserts one subscriber and one artist and reads them back.
-
-**Do not.** Write any business logic. This step is schema only.
-
-### S1.2 `[A]` `∥` Reachability seed data
-
-**Goal.** Populate `origins` and `reachability` per `DESIGN.md` §7.
-
-**Touches.** `data/origins.json`, `data/routes.json`, `scripts/seed-reach.ts`
-
-**Notes.**
-- Research the current direct-route list for CLJ, BUD, OMR, SBZ, OTP, IAS —
-  destination city, airport, airline, rough weekly frequency and operating
-  days where available.
-- CLJ alone is roughly 56 non-stop destinations across 24 countries; BUD is
-  substantially larger. Expect this file to be big, and generate it, don't type
-  it.
-- Derive tier per `(city_key, origin_iata)` using the A/B/C/D rules in §7.2,
-  including the ≤3 h ground rule for tier B. Ground legs need a rough
-  rail-time source; approximate is fine and should be marked approximate.
-- `route_note` is user-facing prose: *"direct CLJ→LBA, Wizz, Tue/Sat"*.
-- Write the script so a monthly re-run refreshes the tables idempotently.
-
-**Done when.** `reachability` is populated; spot-checks return tier A for
-Leeds, London, Milan, Barcelona from CLJ, and tier C for Budapest and Vienna.
-
-**Do not.** Call any flight-pricing API. This is route topology, not fares.
-
-### S1.3 `[A]` `∥` Mailer
-
-**Goal.** A `mailer` interface with a Cloudflare Email Service implementation.
-
-**Touches.** `src/mail/mailer.ts`, `src/mail/cloudflare.ts`
-
-**Notes.**
-- Interface takes `{ to, subject, html, text, headers }` and returns a result
-  including the sent `Message-ID`, which callers persist for threading.
-- Keep the interface narrow enough that a Resend implementation is a new file,
-  not a refactor (§3).
-- Always send a plain-text alternative.
-- **Refuse to send to any address without `subscribers.verified_at`.** On the
-  free plan an unverified recipient fails, so this is a guard, not politeness.
-- **Confirm delivery from the email sending metrics/logs, not the Email
-  Routing summary**, which reports Worker-sent mail as dropped even on success
-  (§3.1). `sent_at` depends on getting this right (§9.3).
-- Set `Auto-Submitted: auto-replied` and `Precedence: bulk` on every outbound
-  message (§12.4).
-
-**Done when.** A test send produces a message in a real inbox with correct
-`Message-ID` returned, and a send to an unverified address is refused locally
-rather than failing upstream.
-
-### S1.4 `[A]` `∥` Inbound mail capture
-
-**Goal.** Email Worker handler that writes raw messages into `inbox`.
-
-**Touches.** `src/mail/inbound.ts`
-
-**Notes.**
-- Parse DKIM/SPF results and store them. Do not interpret the body (§11.1).
-- Extract and store `Message-ID`, `In-Reply-To`, `References`; derive
-  `thread_id` from the root of the references chain.
-- Unknown sender → drop silently, status `ignored`.
-- **Loop guards (§12.3).** Drop mail carrying `Auto-Submitted`,
-  `Precedence: bulk` or `Precedence: list`, or any `List-*` header. Enforce
-  the per-sender hourly cap here, before anything downstream can spend money.
-  This is the single most likely source of a surprise bill; treat it as a
-  correctness requirement, not a nicety.
-
-**Done when.** Mail sent to the address appears as a `pending` inbox row with
-auth flags and threading headers populated; a message with
-`Auto-Submitted: auto-replied` is dropped; the seventh message from one sender
-in an hour is deferred rather than handled.
-
-**Do not.** Call any model. This step never interprets anything.
-
----
-
-## Phase 2 — Source adapters
-
-`∥` parallel with each other. Depends on S1.1 only.
-
-### S2.0 `[A]` Adapter interface and normaliser
-
-**Must land before S2.1–S2.4.** Small step, do it first.
-
-**Goal.** A `SourceAdapter` interface plus the normaliser that turns any
-source's response into `events` rows, including fingerprint computation.
-
-**Touches.** `src/sources/types.ts`, `src/sources/normalise.ts`
-
-**Notes.**
-- Fingerprint is `sha1(mbid | date | normalised_city)` (§4). City
-  normalisation needs to be shared and deterministic — this is the single
-  most important function in the codebase, because everything downstream
-  depends on the same show from three sources collapsing to one row.
-- `content_hash` covers material fields only: date, venue, status, on-sale.
-- Events without an MBID are quarantined, not dropped.
-
-**Done when.** Given hand-written fixture payloads from two different sources
-describing the same show, the normaliser produces one fingerprint.
-
-### S2.1 `[A]` `∥` Ticketmaster adapter
-
-**Touches.** `src/sources/ticketmaster.ts`
-
-Attraction-ID lookup, event fetch, pagination, on-sale and presale dates,
-attraction images. Respect 5 req/s. Record failures to `source_health`.
-
-### S2.2 `[A]` `∥` Bandsintown adapter — disabled
-
-**Touches.** `src/sources/bandsintown.ts`
-
-Write the adapter against the documented endpoint shape, but ship it **behind
-a config flag, defaulting off** (§6.2). It has no key and must not run.
-
-**Do not** use an arbitrary `app_id` to make it work. Their terms restrict the
-API to artists and their representatives; an access request is pending. If the
-flag is off, the adapter returns empty and logs nothing.
-
-### S2.3 `[A]` `∥` Tour-page adapter — primary source
-
-**Touches.** `src/sources/tourpage.ts`
-
-Promoted from a supplementary check to one of the two sources the system
-actually relies on (§6.2). Give it proportionate care.
-
-Fetch the artist's tour page, hash the content, compare against
-`artists.tour_page_hash`. On change, extract JSON-LD `MusicEvent` blocks. If
-JSON-LD exists, emit events with no model call at all. If not, mark the artist
-as needing a model parse and stop — do not call a model from this file.
-
-Handle the common shapes: a bare `MusicEvent`, an array of them, a `@graph`
-wrapper, and `EventSeries`. Test against three real band sites rather than a
-synthetic fixture, since real-world JSON-LD is messier than the spec.
-
-### S2.4 `[A]` `∥` MusicBrainz lookup
-
-**Touches.** `src/sources/musicbrainz.ts`
-
-Name → candidate MBIDs with disambiguation strings, for use by the resolution
-pass. Respect the 1 req/s rate limit and set a proper User-Agent.
-
----
-
-## Phase 3 — Core logic
-
-Sequential. Each depends on the one before.
-
-### S3.1 `[A]` Artist resolution pass
-
-**Depends on.** S2.0–S2.4
-
-**Goal.** Given a band name, produce a populated `artists` row (§5).
-
-**Touches.** `src/core/resolve.ts`
-
-**Notes.**
-- Model-assisted: gather candidates from MusicBrainz, Ticketmaster and
-  Bandsintown, then have the model pick and explain.
-- Ambiguity is returned to the caller as a question, never guessed. The
-  contract is `{ resolved } | { ambiguous, candidates, question }`.
-- Sets `coverage` to `api` or `dark`.
-
-**Done when.** "IDLES", "Low", and a deliberately obscure Romanian band each
-produce the right outcome — two resolved, one flagged dark or ambiguous.
-
-### S3.2 `[A]` Poll orchestrator
-
-**Depends on.** S3.1
-
-**Goal.** The daily deterministic pass. No model calls anywhere in this file.
-
-**Touches.** `src/core/poll.ts`
-
-**Notes.**
-- Poll set is `SELECT DISTINCT artist_id FROM watchlist` — the deduplication
-  requirement (§4). Two subscribers watching one band must produce one fetch.
-- Upsert events by fingerprint; detect material change via `content_hash`.
-- Update `last_polled_at`, `last_activity_at`, `source_health`.
-- All 25 artists every day; no rotation (§6.3).
-
-**Done when.** A run against fixtures inserts new events, updates changed ones,
-and leaves unchanged ones untouched — verified by row-level assertions.
-
-### S3.3 `[A]` Tour clustering and notification state machine
-
-**Depends on.** S3.2
-
-**Goal.** Group events into tours and decide what deserves a notification.
-
-**Touches.** `src/core/tours.ts`, `src/core/notify.ts`
-
-**Notes.**
-- Clustering per §9.1: **no window**. A tour is all currently-known unnotified
-  future dates for an artist at first sighting. Later dates attach to the
-  existing tour and fire `new_dates`.
-- Four triggers per §9.2. Apply the priority→tier filter from §8 *before*
-  writing a notification row, per subscriber.
-- `sent_at` stays NULL until delivery confirms (§9.3). This is the single
-  most important ordering constraint in the system.
-
-**Done when.** A fixture sequence — tour announced, extra dates added a week
-later, one date moved, one on-sale window approaching — produces exactly four
-notification rows for a P1 subscriber and fewer for a P4 one.
-
-### S3.4 `[A]` Reachability join
-
-**Depends on.** S1.2, S3.3
-
-**Goal.** Attach tier and route note to each event, pick the top three per
-tour.
-
-**Touches.** `src/core/reach.ts`
-
-Ranking: direct from CLJ beats direct from BUD beats one-stop from CLJ; apply
-`penalty_minutes` for otherwise-equal options (§7.1).
-
----
-
-## Phase 4 — Output
-
-### S4.1 `[A]` Digest payload builder
-
-**Depends on.** S3.4
-
-**Goal.** Assemble the structured payload the email is rendered from — per
-subscriber, pending notifications, tours, top three dates, tiers, route notes,
-handles, and which contextual affordance applies to each block (§10.2).
-
-**Touches.** `src/digest/payload.ts`, `src/digest/payload.types.ts`
-
-**Done when.** Payload for a fixture DB matches a committed snapshot. Empty
-payload → explicit "no send" result.
-
-### S4.2 `[A]` `∥` HTML email template
-
-**Depends on.** `payload.types.ts` from S4.1 only — write that type first, then
-S4.1 and S4.2 run in parallel.
-
-**Touches.** `src/digest/render.ts`, `src/digest/template.html`
-
-**Notes.**
-- Tables and inline CSS only; no flexbox or grid (§10.4).
-- **Stay inside the 10 ms CPU budget of the Workers Free plan (§3.1).** String
-  templating, no rendering framework, no image processing in the request path.
-  This is the most likely place to trip `EXCEEDED_CPU`.
-- Dark-mode handling explicit.
-- Under ~102 KB total or Gmail clips it.
-- Images from R2, resized. Plain-text alternative required.
-- Contextual affordances and the standing footer per §10.2, with rotating
-  phrasings.
-- Aim for competent and clean. Serious visual design is deferred; do not
-  invent a brand.
-
-**Done when.** Rendered output of the snapshot payload survives Gmail, Apple
-Mail and Outlook web in light and dark mode.
-
-### S4.3 `[A]` Image pipeline
-
-**Depends on.** S2.1, S2.2
-
-**Touches.** `src/images/fetch.ts`
-
-Pull artist images from whichever source supplied the event; Wikimedia Commons
-fallback for `dark` artists. Resize, store in R2, record the key. Logos are
-in scope but optional — skip rather than ship a broken layout.
-
-### S4.4 `[A]` Model client and budget guards
-
-**Depends on.** S1.1
-
-**Goal.** One place where every *billed* model call goes through, with metering
-and degradation built in. Nothing else in the codebase calls the API directly.
-
-Scope note: this covers the **reply path only** (§3). Digest, sweep and
-resolution run on app quota through MCP and never touch this client.
-
-**Touches.** `src/model/client.ts`, `src/model/budget.ts`
-
-**Notes.**
-- Routing per §11.5: Haiku 4.5 by default, Sonnet 5 on escalation.
-- Every call writes to `usage` — tokens in, tokens out, estimated cost.
-- Enforce the monthly ceiling (§12.5): over budget, live replies degrade to
-  being handled by the next scheduled run, and a notice line is queued.
-- Prompt caching enabled on the thread path only.
-- Hard caps enforced here, not in callers: 8 tool calls, 40k input tokens.
-
-**Done when.** A forced over-budget state degrades correctly instead of
-throwing, and `usage` reconciles against a hand-computed figure for a fixture
-run.
-
-**Do not.** Optimise token counts. §12.2 explains why that's not where the
-money is.
-
-### S4.5 `[A]` Agent tools
-
-**Depends on.** S3.1, S3.4, S4.4
-
-**Goal.** The tool catalogue from §11.5, each one returning a decision rather
-than a blob.
-
-**Touches.** `src/agent/tools.ts`
-
-**Notes.**
-- `get_reachability` returns one line from the precomputed table. The model
-  must never work routes out from first principles — this is the main reason
-  trip planning is cheap.
-- `get_tour` returns a compact summary, never 25 raw event rows.
-- `web_search` capped at 3 calls per email, enforced in the tool, not the
-  prompt.
-- Every tool validates that the acting subscriber owns the row it touches.
-
-**Done when.** Each tool has a fixture test asserting its *output size* as
-well as its correctness. A tool that returns too much is a bug.
-
-### S4.6 `[A]` Inbound command handler
-
-**Depends on.** S1.4, S4.5
-
-**Goal.** Interpret pending inbox rows and act (§11.6).
-
-**Touches.** `src/mail/handle.ts`, `src/mail/conversation.ts`
-
-**Notes.**
-- Load the full thread plus the relevant tour rows before invoking the model
-  (§11.2). Stateful from the first commit.
-- Standing preferences append to `subscribers.preferences` (§11.3).
-- Written once, called from two places: the Email Worker on arrival (live) and
-  the daily cron (sweeping deferred or failed rows). Same code path.
-- On cap breach, reply honestly and ask the sender to narrow it down. Never
-  loop, never silently drop.
-
-**Done when.** A reply thread — "add Fontaines D.C." → confirmation → "actually
-make that P1" → confirmation → "how would I get to the Prague date" → trip
-options — works end to end, live, in under a minute, and the `usage` row for
-it is under a cent.
-
----
-
-### S4.7 `[A]` MCP endpoint
-
-**Depends on.** S4.1, S3.1
-
-**Goal.** The surface the Claude scheduled task uses to do the app-quota work
-(§3). Same pattern as kindle-digest.
-
-**Touches.** `src/mcp/server.ts`
-
-**Tools exposed:**
-
-| Tool | Purpose |
+| Step | What exists |
 |---|---|
-| `get_pending_digest(subscriber)` | the structured payload from S4.1 |
-| `submit_digest(subscriber, html, text)` | hand back rendered output; Worker sends it |
-| `get_sweep_targets()` | `dark` artists due a search |
-| `submit_sweep_results(artist_id, events)` | normalised events found by search |
-| `get_unparsed_pages()` | changed tour pages with no JSON-LD |
-| `submit_parsed_events(artist_id, events)` | results of a page parse |
-| `refresh_reachability(rows)` | monthly route table update |
-| `status()` | source health, spend to date, pending counts |
+| S0.1–S0.3 | Repo, Worker, D1, R2, domain, Email Routing + Sending, secrets |
+| S1.1 | Schema and migrations 0001–0005, typed query layer |
+| S1.2 | 477 researched routes, 6 origins, 864 reachability rows, seed script |
+| S1.3 | `Mailer` interface + Cloudflare Email Service implementation |
+| S1.4 | Inbound capture: auth, threading, loop guards, rate limit |
+| S2.0 | Adapter interface, city-key normaliser, fingerprint, content hash |
+| S2.1 | Ticketmaster Discovery adapter |
+| S2.2 | **Skipped** — Bandsintown access not granted, no adapter written |
+| S2.3 | Tour-page adapter: fetch, hash, JSON-LD `MusicEvent` extraction |
+| S2.4 | MusicBrainz artist lookup with retry/backoff |
+| S3.1 | Model-assisted artist resolution |
+| S3.2 | Poll orchestrator (deterministic, no model) |
+| S3.3 | Tour clustering, four notification triggers, priority filter |
+| S3.4 | Reachability join, top-three ranking |
+| S4.1 | Digest payload builder, handles, contextual affordances |
+| S4.2 | HTML + text digest rendering |
+| S4.3 | Image pipeline, Wikimedia fallback, R2 storage |
+| S4.4 | Model client, usage metering, caps, monthly budget ceiling |
+| S4.5 | Agent tool catalogue (nine tools) |
+| S4.6 | Thread-aware conversation loop and reply sending |
+| S4.7 | MCP endpoint, eight scheduled-task tools, bearer-token auth |
+| S4.8 | Fallback digest (36 h) and 30-day heartbeat |
 
-**Notes.**
-- Authenticate with a bearer token in the URL path, as kindle-digest does.
-- Submitted events go through the **same normaliser** as S2.0. The model never
-  writes directly to `events`.
-- Every submission is idempotent — a repeated call must not double-send a
-  digest or duplicate events.
+**Known gaps carried into Phase 5**, all flagged in `PROGRESS.md`:
 
-**Done when.** A manual MCP session can fetch a pending payload, submit
-rendered HTML, and see the email arrive.
-
-### S4.8 `[A]` Fallback digest and heartbeat
-
-**Depends on.** S4.1, S1.3
-
-**Goal.** Guarantee delivery independent of the scheduled task (§10.3).
-
-**Touches.** `src/digest/fallback.ts`
-
-**Notes.**
-- If any notification has been pending >36 h with no successful send, render a
-  plain templated digest straight from D1 — **no model call anywhere in this
-  file** — and send it, with a one-line note that it's the plain version.
-- 30-day heartbeat: nothing sent in a month → short still-alive note with
-  bands watched, source health, and spend to date.
-- This is the step that makes the app-quota decision safe. Treat it as
-  load-bearing, not as a nicety.
-
-**Done when.** With the MCP path disabled entirely, a pending notification
-still results in a readable email within 36 h.
-
-### S4.9 `[R]` Claude scheduled task
-
-Manual. Create a scheduled task in the Claude app pointed at the MCP endpoint,
-running shortly after the Worker cron. Its instructions: fetch sweep targets
-and unparsed pages, do the research, submit results, fetch the pending digest
-payload, write the digest, submit it.
-
-Keep the task's prompt in the repo as `SCHEDULED_TASK.md` so it's versioned
-rather than living only in the app.
+- Nothing runs on a schedule; `scheduled()` is unwired.
+- `src/index.ts`'s email handler writes to `inbox` but never calls
+  `handleInboxRow`, so no inbound mail gets a reply.
+- Adding a band does nothing until the next poll.
+- `resolveArtist`'s own model call is not metered into `usage`.
+- No MIME/quoted-printable decoding of inbound bodies.
+- MCP tool descriptions reference repo internals (see rule 5).
 
 ---
 
-## Phase 5 — Assembly
+## Phase 5 — Revisions
 
-### S5.1 `[A]` Cron wiring
+Changes to already-built code, prompted by walking the system end to end.
+S5.1 and S5.2 gate onboarding in Phase 6; the rest are independent.
 
-**Depends on.** S4.1–S4.8
+### S5.1 `[A]` `∥` Acquisition-time ingest
 
-Single scheduled entry point: poll → cluster → notify → reach → build payload,
-then stop. The Worker does **not** compose the digest — it leaves the payload
-pending for the scheduled task (S4.9) to collect. It does check whether
-anything has gone unsent past the 36 h threshold and fires the fallback if so.
-Cap work per run and defer overflow to tomorrow (§12).
+**Depends on.** Nothing new — S3.1, S3.2, S3.3 and S2.3 all exist.
 
-### S5.2 `[A]` Paula's invite flow
+**Goal.** Adding a band ingests everything about it immediately, so the
+confirmation email can say what's already on and the next scheduled poll is a
+genuine comparison rather than a guaranteed miss.
+
+**Touches.** `src/core/acquire.ts` (new), `src/core/poll.ts`,
+`src/agent/tools.ts`
+
+**Notes.**
+
+- New `acquireArtist(artistId, deps)`: fetch from every enabled source, **hash
+  and parse** the tour page in the same pass, normalise, upsert, then cluster
+  into tours. Reuse `persistRawEvent` and `clusterToursForArtist` rather than
+  reimplementing either.
+- Hashing without parsing is the trap. Store the hash and skip the parse, and
+  the first scheduled poll sees "unchanged" — so the dates already on the page
+  are never ingested at all. Do both.
+- `add_artist` calls this after a successful resolution and returns a compact
+  summary of what was found: tour count, date count, nearest reachable date.
+  The reply needs that to say anything useful.
+- **Do not fire `new_tour` for dates found at acquisition.** A band you just
+  added announcing a tour six months ago isn't news, and surfacing 25 of those
+  as announcements would make the first digest unreadable. Report them in the
+  confirmation reply instead. Suppress via a flag on the clustering call or by
+  marking those tours pre-notified — either is fine, but say which in
+  `PROGRESS.md`.
+
+**Done when.** Adding a band with an active announced tour populates `events`
+and `tours` in the same request, produces no notification rows, and returns a
+summary naming the most reachable upcoming date.
+
+### S5.2 `[A]` Bulk add and raised caps
 
 **Depends on.** S5.1
 
-Manually triggered invite (§2). Introduction email, free-text reply parsed
-into resolved artists, confirmation email with did-you-means. Must survive a
-messy reply — partial names, a band that doesn't exist, three bands on one
-line.
+**Goal.** A 25-band onboarding reply must not breach the per-email tool-call
+cap.
 
-### S5.3 `[A]` Source health reporting
+**Touches.** `src/agent/tools.ts`, `src/model/client.ts`,
+`src/mail/conversation.ts`
 
-**Depends on.** S5.1
+**Notes.**
 
-Warning line in the digest after three consecutive failures for any source
-(§6.2). A separate alert to Rareș only if every source for a given artist has
-been failing for a week.
+- New `add_artists(bands)` taking a list, each entry a name plus optional
+  priority. Resolves each, acquires each, returns one compact result grouped
+  into resolved / ambiguous-with-a-question / not-found. One tool call
+  regardless of list length.
+- Keep single `add_artist`. It's the right shape for "also add Boris", and the
+  model shouldn't have to wrap one band in a list.
+- Raise `MAX_TOOL_CALLS_PER_SESSION` from 8 to **20**. Eight was an
+  anti-runaway guess, not a cost control, and a real trip-planning turn can
+  spend all eight before writing a word.
+- `MAX_CONVERSATION_TURNS` in `conversation.ts` is **12** and would bind before
+  20 tool calls ever fire. Raise it to 25 or the new cap does nothing. This is
+  the actual bug in this step.
+- Leave `MAX_INPUT_TOKENS_PER_SESSION` at 40k. That's the real bound, and the
+  monthly ceiling is the real cost control.
+- Bulk acquisition is slow: each band hits MusicBrainz at 1 req/s plus
+  Ticketmaster plus a tour page. Twenty-five could take a minute or more.
+  Confirm it fits the Worker's limits and record the measured time in
+  `PROGRESS.md`. If it doesn't fit, say so rather than silently truncating the
+  list.
+
+**Done when.** One email listing 25 bands with mixed priorities resolves all of
+them, acquires their current tours, and produces one confirmation reply without
+breaching any cap.
+
+### S5.3 `[A]` `∥` Agent tools over MCP, per-subscriber tokens
+
+**Depends on.** S4.5, S4.7
+
+**Goal.** Let a person drive the system from the Claude app rather than only by
+email — asking what they're watching, adding a band, checking a route — on app
+quota instead of the API key.
+
+**Touches.** `src/mcp/server.ts`, `src/db/schema.ts`, `src/db/queries.ts`,
+`migrations/0006_subscriber_mcp_token.sql`
+
+**Notes.**
+
+- Two kinds of token, and the distinction is the point:
+  - **Admin token** (`MCP_AUTH_TOKEN`, existing secret) — the scheduled task.
+    Sees the scheduled-task tools and can act for any subscriber.
+  - **Subscriber token** (new `subscribers.mcp_token` column) — one per
+    person. Sees the agent tools only, permanently scoped to that subscriber.
+    These tools take no `subscriber_id` argument at all; identity comes from
+    the token. That's what makes it safe to hand someone a URL.
+- Expose the agent tools through MCP, resolving the subscriber from the token
+  rather than from an argument. Their ownership checks are already correct and
+  tested — don't weaken or duplicate them.
+- Expose `add_artists` too once S5.2 lands.
+- Generate tokens with a CSPRNG. Provide a script or a documented
+  `wrangler d1 execute` line for setting one, and record it in `PROGRESS.md` —
+  minting a second subscriber's token shouldn't require reading the source.
+
+**Done when.** Two different subscriber tokens each list only their own
+watchlist, and a subscriber token is refused when it calls a scheduled-task
+tool.
+
+### S5.4 `[A]` Tool descriptions rewritten for their actual reader
+
+**Depends on.** S5.3, so it covers the expanded set
+
+**Goal.** Every description a model reads at runtime makes sense without the
+repository.
+
+**Touches.** `src/mcp/server.ts`, `src/agent/tools.ts`
+
+**Notes.**
+
+- Current descriptions cite design-doc sections, step numbers and internal
+  function names. The model has never seen any of it. One live example
+  explains that a result shape follows a numbered section of a document about
+  not sending "nothing new today" mail — which tells the reader nothing and
+  implies a document it cannot open.
+- Each description states what the tool does, when to reach for it, and what
+  comes back, **including what a normal empty result looks like**, so the
+  model doesn't read emptiness as failure.
+- Same treatment for every field in every input schema.
+- Concretely, the digest fetch should read roughly: *"Returns the concerts
+  waiting to be told to one subscriber, grouped by tour with travel options
+  attached. Returns `send: false` when nothing is waiting — that's normal and
+  common; most days there's nothing."*
+- The bar: hand a description to someone who has never seen this project and
+  ask what the tool does. If they can't say, rewrite it.
+- Rule 5 applies to every future step too. This is cleanup, not permission to
+  stop caring afterwards.
+
+**Done when.** No runtime-visible string contains a section reference, step
+number, file path or internal function name.
+
+### S5.5 `[A]` `∥` Reachability refresh: read tool and quarterly cadence
+
+**Depends on.** S4.7
+
+**Goal.** Make the refresh a diff rather than a rebuild.
+
+**Touches.** `src/mcp/server.ts`, `src/db/queries.ts`, `data/routes.json`
+
+**Notes.**
+
+- Add a read tool returning the current route set — origin, destination,
+  airline, frequency — so the refreshing model can check what changed instead
+  of re-researching all 477 routes from scratch every time.
+- That's a lot to return at once. Support filtering by origin so the task can
+  work one airport per turn.
+- `refresh_reachability` should accept a partial update — changed rows only —
+  rather than requiring the full set. Note in `PROGRESS.md` whether removals
+  are expressible: a discontinued route needs deleting, not merely omitting.
+- Cadence moves from monthly to **quarterly**. Airline networks change on the
+  IATA seasonal boundaries in late March and late October, so a monthly pass
+  mostly rediscovers that nothing moved.
+
+**Done when.** The read tool returns current routes for one origin, and a
+refresh submitting three changed routes updates exactly those three.
+
+### S5.6 `[A]` The skill
+
+**Depends on.** S5.4
+
+**Goal.** One versioned prompt that both the scheduled task and a manual
+`/concert-watch` invocation run.
+
+**Touches.** `SKILL.md`, `SCHEDULED_TASK.md`
+
+**Notes.**
+
+- The routine: fetch sweep targets and unparsed pages, do the research, submit
+  results, fetch each pending digest payload, write the digest, submit it.
+- Accept an optional recipient argument, so `/concert-watch recipient="Paula"`
+  runs it for her alone. With no argument, run for everyone with something
+  pending.
+- Include a quarterly branch for the reachability refresh, run only when asked
+  or when a season boundary has passed.
+- Write it for someone who has never read this repo — rule 5. This file *is* a
+  runtime prompt.
+- State plainly in the skill what the digest should read like: a festival
+  lineup curator, not a status report. That instruction belongs here rather
+  than in code, which is the whole reason for keeping it in the repo.
+
+**Done when.** Running the skill by hand against a seeded pending notification
+produces a sent digest, and `recipient=` scopes it to one person.
+
+---
+
+## Phase 6 — Assembly
+
+### S6.1 `[A]` Live inbound handling
+
+**Depends on.** S5.2
+
+**Goal.** An inbound email actually gets a reply. This is the missing plumbing
+flagged in `PROGRESS.md`.
+
+**Touches.** `src/index.ts`, `src/mail/inbound.ts`
+
+**Notes.**
+
+- After capture writes a `pending` row, call `handleInboxRow` on it. Capture
+  must complete and commit first — a model failure cannot be allowed to lose
+  the message.
+- Rows written as `deferred` (rate-limited, over budget, attempts exhausted)
+  are not handled live; the cron sweeps them.
+- Add MIME/quoted-printable decoding of `body_text`. Plain-text mail from a
+  simple client works today, but an HTML-only or encoded message reaches the
+  model garbled, and real clients send both. `postal-mime` is the usual choice.
+  Watch the free-plan CPU budget — this is one of the two places most likely to
+  trip `EXCEEDED_CPU`, so measure it and record the number.
+
+**Done when.** A real email from a personal account gets a real reply in under
+a minute, and an HTML-only email is read correctly.
+
+### S6.2 `[A]` Cron wiring
+
+**Depends on.** S6.1
+
+**Goal.** The system runs on its own.
+
+**Touches.** `src/index.ts`, `src/core/schedule.ts` (new)
+
+**Notes.**
+
+- Daily at 08:00 EET: poll → cluster → notify → reach → build payload, then
+  stop. The Worker does not compose the digest; it leaves the payload pending
+  for the scheduled task to collect.
+- Same run: sweep `deferred` inbox rows, check the 36-hour fallback threshold,
+  check the 30-day heartbeat.
+- Cap work per run and defer overflow to tomorrow rather than letting a busy
+  day snowball.
+- Consider a second cron at 20:00. The poll path is deterministic and free, and
+  a second run halves worst-case detection latency. Implement as a config
+  toggle defaulting off, and record the reasoning.
+
+**Done when.** A manually triggered scheduled event runs the whole chain
+against real D1 without error, and a seeded 40-hour-old pending notification
+triggers the fallback.
+
+### S6.3 `[A]` Subscriber onboarding
+
+**Depends on.** S6.2
+
+**Goal.** Both subscribers onboard by email — not an admin flow for one person
+and a hand-typed list for the other.
+
+**Touches.** `src/mail/onboard.ts` (new), `src/agent/tools.ts`
+
+**Notes.**
+
+- A manually triggered invite sends the welcome mail. It must say explicitly
+  that replying with their bands will get a confirmation back naming what was
+  found and flagging anything uncertain. Without that promise a messy reply
+  feels risky to send, and messy replies are the expected case.
+- The reply routes through the normal conversation loop using `add_artists`.
+- The confirmation names what resolved, asks about anything ambiguous, and
+  **carries the catch-up**: what these bands already have announced and how
+  reachable it is. This is the first real impression the system makes; give it
+  proportionate care.
+- Infer priority from natural phrasing — "my favourites are X, Y" is highest,
+  "I also like Z" is lower — and state the inferred priorities in the
+  confirmation so they can be corrected in a reply.
+- Must survive: partial names, a band that doesn't exist, several bands on one
+  line, mixed priorities in a single sentence.
+
+**Done when.** A free-text reply listing bands at mixed priorities produces
+correct watchlist rows and a confirmation naming both the resolutions and
+what's already on.
+
+### S6.4 `[A]` `∥` Source health reporting
+
+**Depends on.** S6.2
+
+**Touches.** `src/digest/payload.ts`, `src/digest/fallback.ts`
+
+Warning line in the digest after three consecutive failures for any source. A
+separate alert only if every source for a given artist has been failing for a
+week. Ticketmaster failing silently is now the worst case, since it carries
+most of the reachable shows.
 
 ---
 
 ## Dependency summary
 
 ```
-S0.1 ─┬─ S0.2 ─┬─▶ S1.1 ─┬──────────────────────▶ S2.0 ─┬─ S2.1 ─┐
-      └─ S0.3 ─┘         ├─ S1.2 ──────────────────┐    ├─ S2.2 ─┤
-                         ├─ S1.3 ────────────────┐ │    ├─ S2.3 ─┤
-                         └─ S1.4 ──────────────┐ │ │    └─ S2.4 ─┤
-                                               │ │ │             │
-                                               │ │ └─────────────┴─▶ S3.1
-                                               │ │                    │
-                                               │ │              S3.2 ─┘
-                                               │ │                │
-                                               │ └───── S3.4 ◀─ S3.3
-                                               │          │
-                                               │        S4.1 ─┬─ S4.2 ∥
-                                               │        S4.3 ─┤
-                                               └─────── S4.4 ─┤
-                                                              │
-                                                    S5.1 ─┬─ S5.2
-                                                          └─ S5.3
+Phases 0–4 (done)
+   │
+   ├─ S5.1 ─▶ S5.2 ──────────────┐
+   │                             │
+   ├─ S5.3 ─▶ S5.4 ─▶ S5.6       │
+   │                             │
+   └─ S5.5                       │
+                                 ▼
+                               S6.1 ─▶ S6.2 ─┬─ S6.3
+                                             └─ S6.4
 ```
 
-Parallel batches: **{S1.1, S1.2, S1.3, S1.4}**, then **{S2.1, S2.2, S2.3,
-S2.4}**, then **{S4.1, S4.3, S4.4, S4.8}** with **S4.2** alongside S4.1 once
-the payload type is fixed. S4.5 needs S4.4; S4.6 needs S4.5; S4.7 needs S4.1.
+Parallel: **{S5.1, S5.3, S5.5}** start together. S5.2 needs S5.1; S5.4 needs
+S5.3; S5.6 needs S5.4. Phase 6 is sequential except S6.3 and S6.4, which run in
+parallel once S6.2 lands.
 
-Critical-path note: S4.4 gates every billed model call, and S4.8 is what makes
-the app-quota split safe. Neither is optional and both only need early
-dependencies — start them sooner than their position in the list suggests.
+Critical path to a working system: **S5.1 → S5.2 → S6.1 → S6.2 → S6.3.**
+S5.3–S5.6 improve it, but nothing depends on them to run.
+
+---
+
+## Manual steps for Rareș
+
+- **Mint the MCP admin token.** `openssl rand -hex 16`, then
+  `npx wrangler secret put MCP_AUTH_TOKEN`. The connector URL is then
+  `https://<worker>.workers.dev/mcp/<token>`.
+- **Mint subscriber tokens** after S5.3, one each.
+- **Create the scheduled task** in the Claude app after S5.6, pointed at the
+  MCP endpoint and running shortly after the Worker cron. Its prompt is
+  `SCHEDULED_TASK.md` — paste from there rather than rewriting it in the app,
+  or the versioned copy drifts from what actually runs.
+- **Send the invites** after S6.3.
 
 ---
 
 ## Deliberately out of scope
 
-Everything in `DESIGN.md` §13. In particular: no web UI, no Google Calendar, no
-shared digest, no rotation queue, and no serious visual design pass. If a step
-seems to need one of these, it doesn't — write the reason in `PROGRESS.md` and
-move on.
+Everything in `DESIGN.md` §13: no web UI, no Google Calendar, no shared digest,
+no rotation queue, no serious visual design pass. Also still out: Bandsintown
+(no access), Songkick (no key), flight pricing.
+
+If a step seems to need one of these, it doesn't — write the reason in
+`PROGRESS.md` and move on.

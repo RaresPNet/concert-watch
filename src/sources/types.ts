@@ -10,8 +10,18 @@ import type { EventStatus } from '../db/schema';
  * Sources that produce event listings directly and implement
  * `SourceAdapter`. MusicBrainz (S2.4) is a name-resolution lookup used by
  * artist resolution (S3.1), not an event source, so it isn't one of these.
+ *
+ * `'dark_sweep'` (S4.7) is not a `SourceAdapter` implementation -- it's the
+ * label the MCP endpoint's `submit_sweep_results` tool stamps onto events
+ * the Claude search sweep (DESIGN.md §6.2/§6.4) found for a `dark`-coverage
+ * artist. Added here, rather than left untyped, so `RawSourceEvent`/
+ * `NormalisedEvent` stay exactly as strict about `source` for
+ * model-submitted events as for adapter-submitted ones, instead of the MCP
+ * endpoint needing a type-widening cast to route submitted events through
+ * the same `normaliseEvent`/`upsertEventByFingerprint` path (see
+ * PROGRESS.md's S4.7 entry).
  */
-export type SourceName = 'ticketmaster' | 'bandsintown' | 'tourpage';
+export type SourceName = 'ticketmaster' | 'bandsintown' | 'tourpage' | 'dark_sweep';
 
 /** The artist context an adapter needs to fetch that artist's events. */
 export interface SourceArtistRef {
