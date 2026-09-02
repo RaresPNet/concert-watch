@@ -16,8 +16,11 @@
  * "annoying" and "expensive".
  */
 
-import { getSubscriberByEmail, incrementRateLimit, insertInboxMessage, markInboxHandled } from '../db/queries';
+import PostalMime from 'postal-mime';
+import { getInboxRowById, getSubscriberByEmail, incrementRateLimit, insertInboxMessage, markInboxHandled } from '../db/queries';
 import type { InboxStatus as SchemaInboxStatus } from '../db/schema';
+import { handleInboxRow } from './handle';
+import { CloudflareMailer } from './cloudflare';
 
 // ---------------------------------------------------------------------------
 // Config
@@ -89,8 +92,9 @@ export interface InboundDb {
 	/** Atomically increments the (sender, hour_bucket) counter and returns
 	 * the count *after* incrementing. */
 	bumpRateLimit(fromAddr: string, hourBucket: string): Promise<number>;
-	/** Persists one inbox row. */
-	insertInboxRow(row: InboxInsert): Promise<void>;
+	/** Persists one inbox row. Returns its id -- S6.1 needs it to fetch the
+	 * full row back for `handleInboxRow` right after a `pending` capture. */
+	insertInboxRow(row: InboxInsert): Promise<number>;
 }
 
 /** D1-backed `InboundDb`, adapting `handleInboundEmail`'s shape onto
@@ -129,12 +133,14 @@ export function createD1InboundDb(db: D1Database): InboundDb {
 			// direct update covers the latter without implying it's done. If
 			// queries.ts grows a combined insert-with-note helper, both branches
 			// collapse into one call.
-			if (!r.resultNote) return;
-			if (r.status === 'ignored') {
-				await markInboxHandled(db, id, { status: 'ignored', result_note: r.resultNote });
-			} else {
-				await db.prepare(`UPDATE inbox SET result_note = ? WHERE id = ?`).bind(r.resultNote, id).run();
+			if (r.resultNote) {
+				if (r.status === 'ignored') {
+					await markInboxHandled(db, id, { status: 'ignored', result_note: r.resultNote });
+				} else {
+					await db.prepare(`UPDATE inbox SET result_note = ? WHERE id = ?`).bind(r.resultNote, id).run();
+				}
 			}
+			return id;
 		},
 	};
 }
@@ -216,15 +222,45 @@ export function hourBucket(date: Date): string {
 	return date.toISOString().slice(0, 13);
 }
 
-/** Reads the raw MIME stream and returns *only* the raw text following the
- * header block, capped at MAX_BODY_CHARS. Deliberately not a MIME parser:
- * this step stores the body for a later step to interpret (§11.1) and must
- * not spend CPU decoding multipart/quoted-printable/base64 content it isn't
- * allowed to act on anyway. */
+/** Strips markup from an HTML body down to readable text, for the case where
+ * a message carries no `text/plain` part at all. Deliberately not a real
+ * HTML renderer -- just enough that the model reads prose instead of tags. */
+function htmlToText(html: string): string {
+	return html
+		.replace(/<(script|style)[^>]*>[\s\S]*?<\/\1>/gi, ' ')
+		.replace(/<br\s*\/?>/gi, '\n')
+		.replace(/<\/(p|div|tr|li|h[1-6])>/gi, '\n')
+		.replace(/<[^>]+>/g, ' ')
+		.replace(/&nbsp;/gi, ' ')
+		.replace(/&amp;/gi, '&')
+		.replace(/&lt;/gi, '<')
+		.replace(/&gt;/gi, '>')
+		.replace(/&quot;/gi, '"')
+		.replace(/&#39;/gi, "'")
+		.replace(/[ \t]+/g, ' ')
+		.replace(/\n[ \t]+/g, '\n')
+		.replace(/\n{3,}/g, '\n\n')
+		.trim();
+}
+
+/** Reads the raw MIME stream and returns decoded body text, capped at
+ * MAX_BODY_CHARS. S6.1: plain-text mail worked before this via a naive
+ * "everything after the header block" split, but an HTML-only or
+ * quoted-printable/base64-encoded message reached the model garbled --
+ * `postal-mime` handles multipart, transfer-encoding and charset decoding
+ * properly. Prefers the `text/plain` part; falls back to a stripped-down
+ * `text/html` part for HTML-only mail. On a parse failure, falls back to an
+ * empty body rather than throwing and losing capture of the row entirely --
+ * `raw` is a single-read stream, so a genuine re-parse of the raw bytes
+ * isn't possible once `PostalMime.parse` has started consuming it. */
 export async function extractBodyText(raw: ReadableStream<Uint8Array>): Promise<string> {
-	const full = await new Response(raw).text();
-	const headerEnd = full.search(/\r?\n\r?\n/);
-	const body = headerEnd === -1 ? '' : full.slice(headerEnd).replace(/^\r?\n\r?\n/, '');
+	let body: string;
+	try {
+		const email = await PostalMime.parse(raw);
+		body = (email.text ?? (email.html ? htmlToText(email.html) : '')).trim();
+	} catch {
+		body = '';
+	}
 	return body.length > MAX_BODY_CHARS ? body.slice(0, MAX_BODY_CHARS) : body;
 }
 
@@ -236,6 +272,9 @@ export async function extractBodyText(raw: ReadableStream<Uint8Array>): Promise<
 export interface InboundResult {
 	status: InboxStatus;
 	reason?: string;
+	/** The id of the row just written, for a `pending` result to be handed
+	 * straight to `handleInboxRow` (S6.1). */
+	inboxId: number;
 }
 
 export async function handleInboundEmail(message: InboundEmailLike, db: InboundDb, now: Date = new Date()): Promise<InboundResult> {
@@ -251,7 +290,7 @@ export async function handleInboundEmail(message: InboundEmailLike, db: InboundD
 	const receivedAt = now.toISOString();
 
 	const writeIgnored = async (reason: string, subscriberId: number | null) => {
-		await db.insertInboxRow({
+		const inboxId = await db.insertInboxRow({
 			fromAddr,
 			subscriberId,
 			dkimPass: auth.dkimPass,
@@ -266,7 +305,7 @@ export async function handleInboundEmail(message: InboundEmailLike, db: InboundD
 			status: 'ignored',
 			resultNote: reason,
 		});
-		return { status: 'ignored' as const, reason };
+		return { status: 'ignored' as const, reason, inboxId };
 	};
 
 	// 1. Loop guards, before anything else and regardless of who the sender
@@ -295,7 +334,7 @@ export async function handleInboundEmail(message: InboundEmailLike, db: InboundD
 	const bodyText = await extractBodyText(message.raw);
 
 	if (countThisHour > HOURLY_CAP) {
-		await db.insertInboxRow({
+		const inboxId = await db.insertInboxRow({
 			fromAddr,
 			subscriberId,
 			dkimPass: auth.dkimPass,
@@ -310,11 +349,11 @@ export async function handleInboundEmail(message: InboundEmailLike, db: InboundD
 			status: 'deferred',
 			resultNote: `rate limit: message ${countThisHour} from this sender in bucket ${bucket} (cap ${HOURLY_CAP})`,
 		});
-		return { status: 'deferred', reason: 'rate limited' };
+		return { status: 'deferred', reason: 'rate limited', inboxId };
 	}
 
 	// 4. Capture, untouched. Interpretation is a later step's job entirely.
-	await db.insertInboxRow({
+	const inboxId = await db.insertInboxRow({
 		fromAddr,
 		subscriberId,
 		dkimPass: auth.dkimPass,
@@ -329,19 +368,81 @@ export async function handleInboundEmail(message: InboundEmailLike, db: InboundD
 		status: 'pending',
 		resultNote: null,
 	});
-	return { status: 'pending' };
+	return { status: 'pending', inboxId };
 }
 
 // ---------------------------------------------------------------------------
 // Worker wiring
 // ---------------------------------------------------------------------------
 
+/**
+ * Env slice this file needs beyond the generated `Env` (`DB`, `EMAIL`), for
+ * the same reason `src/mcp/server.ts`'s `McpEnv` reads these off `env as
+ * any`: `ANTHROPIC_API_KEY`/`TICKETMASTER_API_KEY`/`DIGEST_FROM_ADDRESS` are
+ * plain wrangler secrets/vars with no declared binding, matching the
+ * `(env as any).ANTHROPIC_API_KEY` convention already used by
+ * `src/index.ts`/`src/core/resolve.ts`/`src/mcp/server.ts`.
+ */
+export interface EmailHandlerEnv {
+	DB: D1Database;
+	EMAIL: SendEmail;
+	MODEL_MONTHLY_CEILING_USD?: string;
+	ANTHROPIC_API_KEY?: string;
+	TICKETMASTER_API_KEY?: string;
+	/** Overrides the default `From` address, same var `submit_digest` reads. */
+	DIGEST_FROM_ADDRESS?: string;
+}
+
+/** Same default as `src/mcp/server.ts`'s `DEFAULT_FROM_ADDRESS` -- the
+ * domain S1.3 verified a real send against. Not imported from there to keep
+ * this file's dependencies limited to what S6.1's touch list allows; kept in
+ * sync by literal value. */
+const DEFAULT_FROM_ADDRESS = 'concert-watch@raresp.net';
+
 /** Entry point wired into the Worker's default export (see `src/index.ts`).
  * Kept to plumbing only — all logic lives in `handleInboundEmail` above so
  * it can be unit-tested without a real `ForwardableEmailMessage`. */
 export async function emailHandler(message: ForwardableEmailMessage, env: Env): Promise<void> {
 	const db = createD1InboundDb(env.DB);
-	await handleInboundEmail(message, db);
-	// Deliberately no forward/reply/setReject call here: capture only. The
-	// sender gets no response until S4.6 interprets the row.
+	const inboundDb = db;
+	const result = await handleInboundEmail(message, inboundDb);
+	// Deliberately no forward/reply/setReject call here: this Worker never
+	// talks back to the mail transport directly, only via `Mailer.send()`
+	// below, once capture has already committed (S6.1: "capture must
+	// complete and commit first -- a model failure cannot be allowed to lose
+	// the message").
+	if (result.status !== 'pending') return;
+
+	const emailEnv = env as unknown as EmailHandlerEnv;
+	const row = await getInboxRowById(emailEnv.DB, result.inboxId);
+	if (!row) return; // defensive only -- the row we just inserted must exist
+
+	const fromAddress = emailEnv.DIGEST_FROM_ADDRESS ?? DEFAULT_FROM_ADDRESS;
+	const mailer = new CloudflareMailer(emailEnv.EMAIL, {
+		from: fromAddress,
+		// The only recipient a live reply is ever sent to is the sender we're
+		// replying to, who S1.4 has already resolved to a known subscriber
+		// with a passing DKIM/SPF check -- same trust boundary `submit_digest`
+		// applies to its own single-recipient sends (src/mcp/server.ts).
+		isVerifiedRecipient: (email) => email === row.from_addr,
+	});
+
+	try {
+		await handleInboxRow(row, {
+			db: emailEnv.DB,
+			mailer,
+			anthropicApiKey: emailEnv.ANTHROPIC_API_KEY ?? '',
+			ticketmasterApiKey: emailEnv.TICKETMASTER_API_KEY ?? '',
+			fromAddress,
+			budgetEnv: emailEnv,
+		});
+	} catch (err) {
+		// `handleInboxRow` already turns conversation/send failures into an
+		// `error`/`deferred` outcome without throwing (its own attempts-cap and
+		// budget-degrade paths). A throw here means something genuinely
+		// unexpected (e.g. a D1 error mid-write) -- logged, not rethrown, since
+		// the row is already safely captured and the next live retry or cron
+		// sweep will pick it up regardless.
+		console.error(`handleInboxRow threw for inbox row ${result.inboxId}:`, err);
+	}
 }

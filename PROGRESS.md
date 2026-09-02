@@ -4683,3 +4683,155 @@ SKILL.md (currently just Rareș, since Paula's invite per the plan's
 own manual-steps list hasn't gone out yet) until a future step adds
 one.
 ```
+
+## S6.1 — Live inbound handling
+
+**Built.**
+- `src/mail/inbound.ts` — `emailHandler` now does more than capture. After
+  `handleInboundEmail` (S1.4) writes a row, a `pending` result is handed
+  straight to S4.6's `handleInboxRow`: fetches the freshly-written row back
+  (new `getInboxRowById`), builds a `CloudflareMailer` (`isVerifiedRecipient`
+  scoped to the sender's own address, same trust boundary `submit_digest`
+  already applies), and calls `handleInboxRow` with the same
+  `ANTHROPIC_API_KEY`/`TICKETMASTER_API_KEY`/`DIGEST_FROM_ADDRESS` convention
+  `src/mcp/server.ts`'s `McpEnv` already reads off `env as any`. `deferred`
+  and `ignored` results are left alone -- exactly the "the cron sweeps them"
+  split the step calls for. `handleInboxRow` itself is unmodified;
+  everything it needs (attempts guard, budget degrade, send-then-mark-handled
+  ordering) already existed from S4.6.
+- `InboundDb.insertInboxRow` now returns the new row's id (was `Promise<void>`),
+  and `InboundResult` carries it as `inboxId` -- the one shape change needed
+  for the live path to fetch the row it just wrote without re-deriving it
+  from the raw message.
+- MIME decoding (`extractBodyText`): now parses `raw` with `postal-mime`
+  (added as a real dependency, not devDependency -- it runs in production)
+  instead of the old "everything after the first blank line" split. Prefers
+  the decoded `text/plain` part; falls back to a small hand-rolled
+  `htmlToText` (strip `<script>`/`<style>`, turn block-level closing tags and
+  `<br>` into newlines, unescape the five common HTML entities, collapse
+  whitespace) for HTML-only mail, since postal-mime's own entity/whitespace
+  cleanup lives in its non-exported internals. A parse failure (malformed
+  MIME) falls back to an empty body rather than throwing -- `raw` is a
+  single-read stream, so there is no way to re-attempt a naive split once
+  `PostalMime.parse` has started consuming it; losing the interpretation of
+  one malformed message is an acceptable trade against losing capture of the
+  row entirely.
+- `src/db/queries.ts` — new `getInboxRowById` (flagged additive change, same
+  precedent S4.6 itself used for `markInboxDeferred`/`sent_replies`: a small,
+  narrow query addition made from within a later step, not the step's
+  official touch list, because the step's own goal needs it and nothing
+  else in the repo already provides it).
+- `src/index.ts` — **not touched.** The step's touch list named it, but once
+  `emailHandler` (already the sole thing `index.ts` wires into `email:`)
+  does the full capture-then-handle sequence itself, there was nothing left
+  for `index.ts` to add; it already just re-exports `emailHandler` unchanged.
+
+**Judgment calls, flagged.**
+- **A throw out of `handleInboxRow` itself (not one of its own handled
+  outcomes) is caught and logged, not rethrown.** `handleInboxRow` already
+  turns every conversation-loop/send failure it anticipates into a typed
+  `error`/`deferred` outcome without throwing (S4.6's attempts-cap and
+  budget-degrade paths). A throw reaching `emailHandler` would mean something
+  genuinely unexpected (e.g. a D1 error mid-write) -- by that point capture
+  has already committed, so swallowing it here rather than letting it
+  propagate out of the Worker's `email()` handler keeps the delivery-facing
+  contract simple (message accepted) while the row itself is left exactly
+  where the failed attempt left it for the next live retry or cron sweep to
+  pick up.
+- **`DEFAULT_FROM_ADDRESS` is redefined locally in `inbound.ts` rather than
+  imported from `src/mcp/server.ts`**, which already has the same constant.
+  `src/mcp/server.ts` is outside this step's touch list; duplicating one
+  literal (`concert-watch@raresp.net`) was judged cheaper than widening the
+  touch list to add an export. If a third call site ever needs it, worth
+  promoting to a shared module then.
+- **`EmailHandlerEnv` is a second narrow `env` slice**, parallel to
+  `src/mcp/server.ts`'s `McpEnv` rather than reusing it, for the same
+  touch-list reason as above -- both read the identical set of ambient
+  secrets/vars off `env as any`/`as unknown as EmailHandlerEnv`.
+
+**Left undone.**
+- **CPU budget on the free plan was not measured.** The step's own notes
+  flag MIME decoding as "one of the two places most likely to trip
+  `EXCEEDED_CPU,` so measure it and record the number" -- not possible from
+  this environment (no deploy access, consistent with every other
+  model/network-touching step in this codebase's own precedent). Whoever
+  next has deploy access should send a large/attachment-heavy real email
+  through the deployed Worker and check the CPU-time figure in the
+  Cloudflare dashboard before trusting this against a genuinely large
+  message; `MAX_BODY_CHARS` (20,000, unchanged from S1.4) caps the *stored*
+  body but `postal-mime` still parses the full raw message before that cap
+  is applied.
+- **No live Anthropic round trip or real Cloudflare Email Routing delivery**
+  was exercised, for the same no-credentials/no-deploy reason as S4.6.
+  Verified instead via a scripted harness (below) driving the real
+  `emailHandler`/`extractBodyText`/`getInboxRowById` code paths against an
+  in-memory `node:sqlite` D1 shim, a stubbed `EMAIL` binding, and a scripted
+  fake `fetch` for the one Anthropic call the reply path makes. The step's
+  own "Done when" ("a real email from a personal account gets a real reply
+  in under a minute") still needs a real send through the deployed Worker.
+- **`resolveArtist`'s un-metered Anthropic call** (flagged first in S4.6) is
+  unchanged -- outside this step's touch list.
+
+**Verification performed.**
+```
+npx tsc --noEmit -p tsconfig.json                                    # clean
+npx prettier --check src/mail/inbound.ts src/db/queries.ts           # clean
+
+# Fixture harness (node:sqlite DatabaseSync, real migrations/0001-0006
+# replayed via raw.exec, a hand-rolled D1 shim, a stubbed EMAIL binding, and
+# a scripted fake global fetch answering only api.anthropic.com with a
+# single end_turn/no-tool-use response) -- same convention as S4.6's own
+# harness. Temporarily created at repo root as test-s61-inbound.mts and
+# deleted before finishing (git status clean afterward; tsx installed with
+# --no-save and uninstalled afterward too -- not a real project dependency).
+node --experimental-sqlite --import tsx test-s61-inbound.mts
+  extractBodyText: MIME decoding (S6.1)
+  PASS plain-text body decodes verbatim
+  PASS HTML-only body is stripped of tags
+  PASS HTML-only body decodes quoted-printable soft space (=20)
+  PASS HTML-only body keeps both paragraphs
+  PASS quoted-printable plain text decodes =3F to ?
+
+  emailHandler: live wiring (S6.1)
+  PASS a pending row triggers exactly one Anthropic call
+  PASS a pending row results in exactly one sent reply
+  PASS the reply goes to the original sender
+  PASS the reply is threaded (In-Reply-To)
+  PASS the reply subject is Re:-prefixed
+  PASS the inbox row is marked handled
+  PASS the inbox row records a result_note
+  PASS a sent_replies row was persisted
+  PASS an unknown sender makes no Anthropic call
+  PASS an unknown sender triggers no send
+  PASS the unknown-sender row is ignored, not pending
+  PASS a rate-limited row makes no Anthropic call
+  PASS at least one burst message was deferred by the rate limit
+
+18 passed, 0 failed
+```
+
+**Proposed commit message.**
+```
+Wire live inbound handling: capture now gets a real reply (S6.1)
+
+emailHandler (src/mail/inbound.ts) no longer stops at capture: a
+freshly-written pending row is fetched back (new getInboxRowById)
+and handed straight to S4.6's handleInboxRow via a CloudflareMailer
+scoped to the sender's own address, closing the gap PROGRESS.md's
+S4.6 entry flagged explicitly ("index.ts's email handler writes to
+inbox but never calls handleInboxRow, so no inbound mail gets a
+reply"). deferred/ignored rows are left for the cron sweep, per the
+step's own split. Also replaces the naive "everything after the
+header block" body extraction with real MIME decoding via
+postal-mime (new production dependency): prefers the decoded
+text/plain part, falls back to a stripped-down text/html part for
+HTML-only mail, so an HTML-only or quoted-printable-encoded message
+no longer reaches the model garbled. src/index.ts needed no changes
+-- it already just re-exports emailHandler, which now does the full
+job itself. Verified via a fixture harness driving the real
+emailHandler/extractBodyText against an in-memory D1 shim and a
+scripted fake Anthropic response; a live send through the deployed
+Worker is still the step's own stated Done-when and remains
+unverified from this environment, per this codebase's standing
+precedent for the reply path.
+```

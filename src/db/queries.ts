@@ -720,6 +720,14 @@ export async function getPendingInboxMessages(db: D1Database): Promise<InboxRow[
 	return result.results;
 }
 
+/** S6.1: fetches the row `handleInboundEmail` just inserted, so the live
+ * Email Worker path can hand it straight to `handleInboxRow` without
+ * re-deriving it from the raw message. */
+export async function getInboxRowById(db: D1Database, id: number): Promise<InboxRow | null> {
+	const result = await db.prepare(`SELECT * FROM inbox WHERE id = ?`).bind(id).first<InboxRow>();
+	return result ?? null;
+}
+
 export async function getInboxThread(db: D1Database, threadId: string): Promise<InboxRow[]> {
 	const result = await db.prepare(`SELECT * FROM inbox WHERE thread_id = ? ORDER BY received_at ASC`).bind(threadId).all<InboxRow>();
 	return result.results;
