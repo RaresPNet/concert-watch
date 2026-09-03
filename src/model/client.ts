@@ -225,7 +225,10 @@ export class ModelSession {
 		this.db = opts.db;
 		this.apiKey = opts.anthropicApiKey;
 		this.path = opts.path;
-		this.fetchImpl = opts.fetchImpl ?? fetch;
+		// Bare `fetch` loses its required `this` (globalThis) once stored on
+		// this instance and called as `this.fetchImpl(...)` -- see
+		// src/sources/ticketmaster.ts's identical fix/comment for the same bug.
+		this.fetchImpl = opts.fetchImpl ?? fetch.bind(globalThis);
 		this.now = opts.now ?? (() => new Date());
 	}
 
