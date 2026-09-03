@@ -20,6 +20,7 @@ import { runConversation, type ConversationDeps, type ConversationResult } from 
 import { incrementInboxAttempts, insertSentReply, markInboxDeferred, markInboxHandled } from '../db/queries';
 import type { InboxRow } from '../db/schema';
 import type { Mailer } from './mailer';
+import { renderReplyHtml } from './format';
 
 /**
  * DESIGN.md §12.4: "inbox.attempts, maximum 2, then the row is marked
@@ -147,7 +148,7 @@ export async function handleInboxRow(row: InboxRow, deps: HandleInboxRowDeps): P
 		sendResult = await deps.mailer.send({
 			to: row.from_addr,
 			subject: replySubject(row.subject),
-			html: `<p>${escapeHtml(result.replyText).replace(/\n/g, '<br>')}</p>`,
+			html: renderReplyHtml(result.replyText),
 			text: result.replyText,
 			headers: {
 				...(threading.inReplyTo ? { 'In-Reply-To': threading.inReplyTo } : {}),
@@ -200,8 +201,4 @@ async function handleFailure(row: InboxRow, deps: HandleInboxRowDeps, err: unkno
 		deferred = true;
 	}
 	return { outcome: 'error', reason: message, attempts, deferred };
-}
-
-function escapeHtml(s: string): string {
-	return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }

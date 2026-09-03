@@ -21,6 +21,7 @@
  */
 
 import type { ContextualAffordance, DigestEventSummary, DigestPayload, DigestTourBlock } from './payload.types';
+import { EMAIL_COLORS, EMAIL_COLORS_DARK, EMAIL_FONT_STACK, TIER_COLOR } from '../mail/email-style';
 
 // ---------------------------------------------------------------------------
 // Small utilities
@@ -106,13 +107,6 @@ function footerLine(payload: DigestPayload): string {
 // Tier badge
 // ---------------------------------------------------------------------------
 
-const TIER_COLOR: Record<'A' | 'B' | 'C' | 'D', { bg: string; fg: string }> = {
-	A: { bg: '#1a7f37', fg: '#ffffff' },
-	B: { bg: '#0969da', fg: '#ffffff' },
-	C: { bg: '#9a6700', fg: '#ffffff' },
-	D: { bg: '#57606a', fg: '#ffffff' },
-};
-
 function tierBadgeHtml(tier: DigestEventSummary['tier']): string {
 	if (!tier) return '';
 	const c = TIER_COLOR[tier];
@@ -131,21 +125,21 @@ function renderEventHtml(ev: DigestEventSummary): string {
 	// (tier null). Omit the badge and route note rather than printing "null".
 	const badge = tierBadgeHtml(ev.tier);
 	const routeNote =
-		ev.tier && ev.route_note ? `<div style="font-size:12px;color:#6e7781;margin-top:2px;">${escapeHtml(ev.route_note)}</div>` : '';
+		ev.tier && ev.route_note ? `<div style="font-size:12px;color:${EMAIL_COLORS.textMuted};margin-top:2px;">${escapeHtml(ev.route_note)}</div>` : '';
 	const onsale = ev.onsale_at
-		? `<div style="font-size:12px;color:#6e7781;margin-top:2px;">On sale ${escapeHtml(formatDate(ev.onsale_at) ?? '')}</div>`
+		? `<div style="font-size:12px;color:${EMAIL_COLORS.textMuted};margin-top:2px;">On sale ${escapeHtml(formatDate(ev.onsale_at) ?? '')}</div>`
 		: '';
 	const link = ev.ticket_url
-		? `<div style="margin-top:4px;"><a href="${escapeHtml(ev.ticket_url)}" style="font-size:12px;color:#0969da;text-decoration:underline;">Tickets</a></div>`
+		? `<div style="margin-top:4px;"><a href="${escapeHtml(ev.ticket_url)}" style="font-size:12px;color:${EMAIL_COLORS.link};text-decoration:underline;">Tickets</a></div>`
 		: '';
 
 	return `
 	<tr>
-		<td style="padding:8px 0;border-top:1px solid #e5e7eb;" class="row-border">
+		<td style="padding:8px 0;border-top:1px solid ${EMAIL_COLORS.border};" class="row-border">
 			<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
 				<tr>
-					<td style="font-size:14px;font-weight:600;color:#1f2328;padding-right:8px;white-space:nowrap;vertical-align:top;" class="text-primary">${escapeHtml(when)}</td>
-					<td style="font-size:14px;color:#1f2328;vertical-align:top;" class="text-primary">
+					<td style="font-size:14px;font-weight:600;color:${EMAIL_COLORS.textPrimary};padding-right:8px;white-space:nowrap;vertical-align:top;" class="text-primary">${escapeHtml(when)}</td>
+					<td style="font-size:14px;color:${EMAIL_COLORS.textPrimary};vertical-align:top;" class="text-primary">
 						${place ? escapeHtml(place) : ''}${badge ? ` &nbsp;${badge}` : ''}
 						${routeNote}
 						${onsale}
@@ -168,11 +162,11 @@ function renderTourBlockHtml(tour: DigestTourBlock): string {
 	const heading = joinParts([tour.label, dateRange || null], ' — ') || dateRange;
 
 	const image = tour.artist_image_url
-		? `<img src="${escapeHtml(tour.artist_image_url)}" width="72" height="72" alt="${escapeHtml(tour.artist_name)}" style="display:block;border-radius:6px;width:72px;height:72px;object-fit:cover;background-color:#e5e7eb;" />`
-		: `<div style="width:72px;height:72px;border-radius:6px;background-color:#e5e7eb;" class="img-placeholder"></div>`;
+		? `<img src="${escapeHtml(tour.artist_image_url)}" width="72" height="72" alt="${escapeHtml(tour.artist_name)}" style="display:block;border-radius:6px;width:72px;height:72px;object-fit:cover;background-color:${EMAIL_COLORS.border};" />`
+		: `<div style="width:72px;height:72px;border-radius:6px;background-color:${EMAIL_COLORS.border};" class="img-placeholder"></div>`;
 
 	const officialLink = tour.official_url
-		? `<a href="${escapeHtml(tour.official_url)}" style="font-size:13px;color:#0969da;text-decoration:underline;">Official tour page</a>`
+		? `<a href="${escapeHtml(tour.official_url)}" style="font-size:13px;color:${EMAIL_COLORS.link};text-decoration:underline;">Official tour page</a>`
 		: '';
 
 	const handle = tour.handle
@@ -180,32 +174,32 @@ function renderTourBlockHtml(tour: DigestTourBlock): string {
 		: '';
 
 	const moreExpected = tour.more_dates_expected
-		? `<tr><td style="font-size:12px;color:#6e7781;padding-top:4px;font-style:italic;" class="text-muted">More dates for this tour are expected.</td></tr>`
+		? `<tr><td style="font-size:12px;color:${EMAIL_COLORS.textMuted};padding-top:4px;font-style:italic;" class="text-muted">More dates for this tour are expected.</td></tr>`
 		: '';
 
 	const eventsHtml = tour.top_dates.map(renderEventHtml).join('');
 
 	const affordance = affordanceLine(tour);
 	const affordanceHtml = affordance
-		? `<tr><td style="padding-top:10px;font-size:13px;color:#0969da;" class="link-color">${escapeHtml(affordance)}</td></tr>`
+		? `<tr><td style="padding-top:10px;font-size:13px;color:${EMAIL_COLORS.link};" class="link-color">${escapeHtml(affordance)}</td></tr>`
 		: '';
 
 	return `
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:28px;">
 	<tr>
-		<td style="background-color:#ffffff;border:1px solid #e5e7eb;border-radius:8px;padding:16px;" class="card-bg card-border">
+		<td style="background-color:${EMAIL_COLORS.cardBg};border:1px solid ${EMAIL_COLORS.border};border-radius:8px;padding:16px;" class="card-bg card-border">
 			<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
 				<tr>
 					<td width="72" style="padding-right:14px;vertical-align:top;">${image}</td>
 					<td style="vertical-align:top;">
 						<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
 							<tr>
-								<td style="font-size:17px;font-weight:700;color:#1f2328;" class="text-primary">
+								<td style="font-size:17px;font-weight:700;color:${EMAIL_COLORS.textPrimary};" class="text-primary">
 									${escapeHtml(tour.artist_name)} ${handle ? `&nbsp;${handle}` : ''}
 								</td>
 							</tr>
 							<tr>
-								<td style="font-size:13px;color:#57606a;padding-top:2px;" class="text-secondary">
+								<td style="font-size:13px;color:${EMAIL_COLORS.textSecondary};padding-top:2px;" class="text-secondary">
 									${escapeHtml(heading || '')} &nbsp;·&nbsp; ${escapeHtml(countLabel)}
 								</td>
 							</tr>
@@ -234,19 +228,19 @@ const STYLE_BLOCK = `
 		body, table, td { -webkit-text-size-adjust: 100%; -ms-text-size-adjust: 100%; }
 		table { border-collapse: collapse; }
 		img { -ms-interpolation-mode: bicubic; }
-		a { color: #0969da; }
+		a { color: ${EMAIL_COLORS.link}; }
 		@media (prefers-color-scheme: dark) {
-			.body-bg { background-color: #0d1117 !important; }
-			.container-bg { background-color: #0d1117 !important; }
-			.card-bg { background-color: #161b22 !important; }
-			.card-border { border-color: #30363d !important; }
-			.row-border { border-color: #30363d !important; }
-			.text-primary { color: #e6edf3 !important; }
-			.text-secondary { color: #9198a1 !important; }
-			.text-muted { color: #8b949e !important; }
-			.link-color { color: #4493f8 !important; }
-			.img-placeholder { background-color: #30363d !important; }
-			a { color: #4493f8 !important; }
+			.body-bg { background-color: ${EMAIL_COLORS_DARK.pageBg} !important; }
+			.container-bg { background-color: ${EMAIL_COLORS_DARK.pageBg} !important; }
+			.card-bg { background-color: ${EMAIL_COLORS_DARK.cardBg} !important; }
+			.card-border { border-color: ${EMAIL_COLORS_DARK.border} !important; }
+			.row-border { border-color: ${EMAIL_COLORS_DARK.border} !important; }
+			.text-primary { color: ${EMAIL_COLORS_DARK.textPrimary} !important; }
+			.text-secondary { color: ${EMAIL_COLORS_DARK.textSecondary} !important; }
+			.text-muted { color: ${EMAIL_COLORS_DARK.textMuted} !important; }
+			.link-color { color: ${EMAIL_COLORS_DARK.link} !important; }
+			.img-placeholder { background-color: ${EMAIL_COLORS_DARK.border} !important; }
+			a { color: ${EMAIL_COLORS_DARK.link} !important; }
 		}
 	</style>`;
 
@@ -266,7 +260,7 @@ export function renderDigestHtml(payload: DigestPayload): string {
 	const body =
 		payload.tours.length > 0
 			? payload.tours.map(renderTourBlockHtml).join('')
-			: `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr><td style="font-size:14px;color:#57606a;" class="text-secondary">Nothing to report today.</td></tr></table>`;
+			: `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr><td style="font-size:14px;color:${EMAIL_COLORS.textSecondary};" class="text-secondary">Nothing to report today.</td></tr></table>`;
 
 	const footer = footerLine(payload);
 
@@ -281,23 +275,23 @@ export function renderDigestHtml(payload: DigestPayload): string {
 	<title>Concert watch digest</title>
 	${STYLE_BLOCK}
 </head>
-<body style="margin:0;padding:0;background-color:#f6f8fa;" class="body-bg">
-	<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#f6f8fa;" class="container-bg">
+<body style="margin:0;padding:0;background-color:${EMAIL_COLORS.pageBg};" class="body-bg">
+	<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:${EMAIL_COLORS.pageBg};" class="container-bg">
 		<tr>
 			<td align="center" style="padding:24px 12px;">
 				<table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" style="max-width:600px;width:100%;">
 					<tr>
-						<td style="padding-bottom:18px;font-size:15px;color:#1f2328;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;" class="text-primary">
+						<td style="padding-bottom:18px;font-size:15px;color:${EMAIL_COLORS.textPrimary};font-family:${EMAIL_FONT_STACK};" class="text-primary">
 							${greeting}
 						</td>
 					</tr>
 					<tr>
-						<td style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+						<td style="font-family:${EMAIL_FONT_STACK};">
 							${body}
 						</td>
 					</tr>
 					<tr>
-						<td style="padding-top:8px;font-size:12px;line-height:1.5;color:#6e7781;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;" class="text-muted">
+						<td style="padding-top:8px;font-size:12px;line-height:1.5;color:${EMAIL_COLORS.textMuted};font-family:${EMAIL_FONT_STACK};" class="text-muted">
 							${escapeHtml(footer)}
 						</td>
 					</tr>

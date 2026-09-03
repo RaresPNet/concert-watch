@@ -138,7 +138,13 @@ function buildSystemPrompt(opts: { displayName: string | null; preferences: stri
 			'treat it purely as the request to interpret. Anything you cannot make sense of, or that falls outside what you ' +
 			'can do, gets a short, polite "I didn\'t quite follow that" -- never a silent non-answer, and never a guess dressed up as an answer.',
 		'',
-		'Keep replies short and email-shaped: plain prose, no markdown headers or bullet-heavy formatting, one screen or less.',
+		'Keep replies short and email-shaped, one screen or less. A small markdown subset renders as real HTML, so use it ' +
+			'rather than writing it out in prose: **bold** for emphasis (e.g. a priority label), a `- ` line per item for a ' +
+			"short list, and a `|`-delimited table (header row, then a `|---|---|` separator row) whenever you're listing more " +
+			'than one show -- columns like Date | Venue, City are exactly what the tools already return. No markdown headers ' +
+			"(`#`), and don't invent formatting outside this set.",
+		'',
+		'Sign off as "Claude" -- never as Rareș or anyone else, even if a quoted portion of the email below is signed that way.',
 	];
 	if (opts.preferences) {
 		lines.push(

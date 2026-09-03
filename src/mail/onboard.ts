@@ -20,7 +20,13 @@
  * about *receiving* the reply needed to change here.
  */
 
-import { getSubscriberById } from '../db/queries';
+import {
+	clearSubscriberPreferences,
+	deleteInboxForSubscriber,
+	deleteSentRepliesForSubscriber,
+	deleteWatchlistForSubscriber,
+	getSubscriberById,
+} from '../db/queries';
 import type { Mailer } from './mailer';
 
 // ---------------------------------------------------------------------------
@@ -38,15 +44,18 @@ function escapeHtml(input: string): string {
 }
 
 /**
- * The person this system already answers to (Rareș) is the one introducing
- * it, per DESIGN.md's own worked example: "this is Rareș's concert
- * watcher." Kept as a literal here rather than threaded through as a
+ * The person this system already answers to (Rareș) is who it's introduced
+ * as belonging to, per DESIGN.md's own worked example: "this is Rareș's
+ * concert watcher." Kept as a literal here rather than threaded through as a
  * parameter -- this system has exactly two subscribers by design (DESIGN.md
  * §1's own non-goal: "Not multi-tenant... hardcoded assumptions are fine
  * where they buy simplicity"), and the invite is always introducing the
  * same one person's project.
  */
 const INTRODUCER_NAME = 'Rareș';
+
+/** Every outbound email in this system signs off as Claude, not Rareș -- same convention `src/mail/conversation.ts`'s system prompt sets for reply-path mail. */
+const SIGNATURE = 'Claude';
 
 const SUBJECT = 'A heads-up before the concert emails start';
 
@@ -75,7 +84,7 @@ export function composeWelcomeInvite(subscriber: { display_name: string | null }
 		'Once a couple of bands are on the list, replying at any time adds or removes a band, changes how eagerly you want to hear ' +
 			"about one, pauses the whole thing, or asks about travel for a specific date. It's a running conversation, not a one-time form.",
 		'',
-		INTRODUCER_NAME,
+		SIGNATURE,
 	];
 
 	const htmlParagraphs = [
@@ -95,7 +104,7 @@ export function composeWelcomeInvite(subscriber: { display_name: string | null }
 		'<p>Once a couple of bands are on the list, replying at any time adds or removes a band, changes how eagerly you want to hear ' +
 			"about one, pauses the whole thing, or asks about travel for a specific date. It's a running conversation, not a " +
 			'one-time form.</p>',
-		`<p>${escapeHtml(INTRODUCER_NAME)}</p>`,
+		`<p>${escapeHtml(SIGNATURE)}</p>`,
 	];
 
 	const html = `<!doctype html>
@@ -119,12 +128,11 @@ export type SendWelcomeInviteResult =
 /**
  * Sends the welcome invite to one subscriber, by id. This is the "manually
  * triggered" send DESIGN.md's onboarding note describes ("Rareș triggers a
- * one-time invite") -- there is deliberately no HTTP route, cron entry, or
- * MCP tool wired to this function. `src/index.ts` (an HTTP admin route) and
- * `src/mcp/server.ts` (an MCP tool) were both candidate places to expose a
- * trigger, but both are outside this step's touch list (`src/mail/onboard.ts`,
- * `src/agent/tools.ts` only) -- see PROGRESS.md's S6.3 entry for the reasoning
- * and for exactly how this function is meant to be invoked in the meantime.
+ * one-time invite") -- reachable from a real, permanently-wired admin route
+ * (`src/index.ts`'s `/admin/reset-onboarding`, gated by the `ADMIN_OPS_TOKEN`
+ * secret) rather than a route hand-added and torn down per use. See
+ * `resetSubscriberOnboarding` below for the reset-and-resend that route
+ * actually calls.
  *
  * Mirrors `src/mcp/server.ts`'s `submit_digest` handler's own explicit
  * `verified_at` check (same reasoning: DESIGN.md §3 -- Cloudflare's free
@@ -157,4 +165,39 @@ export async function sendWelcomeInvite(db: D1Database, mailer: Mailer, subscrib
 	} catch (err) {
 		return { sent: false, subscriber_id: subscriberId, reason: err instanceof Error ? err.message : String(err) };
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Resetting onboarding
+// ---------------------------------------------------------------------------
+
+export interface ResetSubscriberOnboardingResult {
+	subscriber_id: number;
+	deleted: { watchlist: number; inbox: number; sent_replies: number };
+	invite: SendWelcomeInviteResult;
+}
+
+/**
+ * Wipes one subscriber back to a pre-onboarding state and resends the
+ * welcome invite: every watchlist entry, every inbox row (the subscriber's
+ * own sent mail is never touched -- only what *they* sent in), every
+ * sent_replies row, and any standing `preferences` text. The subscriber row
+ * itself (id, email, verified_at, display_name) is left alone -- re-sending
+ * the invite still needs a verified destination, and there is no reason to
+ * make a subscriber re-verify their address just to reset their watchlist.
+ *
+ * Does not touch `artists`/`tours`/`events` -- those are shared reference
+ * data (which bands exist, what tour dates are known), not
+ * subscriber-specific, so "reset onboarding" has no reason to affect them.
+ */
+export async function resetSubscriberOnboarding(db: D1Database, mailer: Mailer, subscriberId: number): Promise<ResetSubscriberOnboardingResult> {
+	const [watchlist, inbox, sentReplies] = await Promise.all([
+		deleteWatchlistForSubscriber(db, subscriberId),
+		deleteInboxForSubscriber(db, subscriberId),
+		deleteSentRepliesForSubscriber(db, subscriberId),
+	]);
+	await clearSubscriberPreferences(db, subscriberId);
+
+	const invite = await sendWelcomeInvite(db, mailer, subscriberId);
+	return { subscriber_id: subscriberId, deleted: { watchlist, inbox, sent_replies: sentReplies }, invite };
 }

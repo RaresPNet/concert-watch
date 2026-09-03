@@ -95,6 +95,10 @@ export async function appendSubscriberPreference(db: D1Database, id: number, not
 		.run();
 }
 
+export async function clearSubscriberPreferences(db: D1Database, id: number): Promise<void> {
+	await db.prepare(`UPDATE subscribers SET preferences = NULL WHERE id = ?`).bind(id).run();
+}
+
 // ---------------------------------------------------------------------------
 // artists
 // ---------------------------------------------------------------------------
@@ -262,6 +266,12 @@ export async function getWatchlistWithArtists(
 export async function removeFromWatchlist(db: D1Database, subscriberId: number, artistId: number): Promise<boolean> {
 	const result = await db.prepare(`DELETE FROM watchlist WHERE subscriber_id = ? AND artist_id = ?`).bind(subscriberId, artistId).run();
 	return (result.meta?.changes ?? 0) > 0;
+}
+
+/** Removes every watchlist row for one subscriber (onboarding reset). Returns the number of rows deleted. */
+export async function deleteWatchlistForSubscriber(db: D1Database, subscriberId: number): Promise<number> {
+	const result = await db.prepare(`DELETE FROM watchlist WHERE subscriber_id = ?`).bind(subscriberId).run();
+	return result.meta?.changes ?? 0;
 }
 
 /**
@@ -798,6 +808,12 @@ export async function markInboxDeferred(db: D1Database, id: number, resultNote: 
 	await db.prepare(`UPDATE inbox SET status = 'deferred', result_note = ? WHERE id = ?`).bind(resultNote, id).run();
 }
 
+/** Removes every inbox row for one subscriber (onboarding reset). Returns the number of rows deleted. */
+export async function deleteInboxForSubscriber(db: D1Database, subscriberId: number): Promise<number> {
+	const result = await db.prepare(`DELETE FROM inbox WHERE subscriber_id = ?`).bind(subscriberId).run();
+	return result.meta?.changes ?? 0;
+}
+
 // ---------------------------------------------------------------------------
 // sent_replies (migrations/0005_sent_replies.sql, S4.6)
 // ---------------------------------------------------------------------------
@@ -853,6 +869,12 @@ export async function getSentRepliesForThread(db: D1Database, threadId: string):
 		.bind(threadId)
 		.all<SentReplyRow>();
 	return result.results;
+}
+
+/** Removes every sent-reply row for one subscriber (onboarding reset). Returns the number of rows deleted. */
+export async function deleteSentRepliesForSubscriber(db: D1Database, subscriberId: number): Promise<number> {
+	const result = await db.prepare(`DELETE FROM sent_replies WHERE subscriber_id = ?`).bind(subscriberId).run();
+	return result.meta?.changes ?? 0;
 }
 
 // ---------------------------------------------------------------------------

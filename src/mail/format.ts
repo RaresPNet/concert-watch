@@ -6,9 +6,12 @@
  * wrote, which the system prompt (`src/mail/conversation.ts`) asks to use a
  * small, fixed markdown subset for: **bold**, blank-line-separated
  * paragraphs, `- ` bullet lists, and `|`-delimited tables for listing dates.
- * Colours match `src/digest/render.ts`'s palette so a reply and a digest
- * email look like the same product.
+ * Shares its palette with `src/digest/render.ts` via `./email-style` so a
+ * reply and a digest email look like the same product, even though they
+ * don't share a rendering engine -- see that file's header for why not.
  */
+
+import { EMAIL_COLORS, EMAIL_FONT_STACK } from './email-style';
 
 function escapeHtml(input: string): string {
 	return input.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
@@ -39,7 +42,7 @@ function renderTable(lines: string[]): string {
 	const headHtml = header
 		.map(
 			(cell) =>
-				`<th align="left" style="padding:6px 12px 6px 0;font-size:12px;color:#57606a;border-bottom:1px solid #e5e7eb;font-weight:600;">${renderInline(cell)}</th>`,
+				`<th align="left" style="padding:6px 12px 6px 0;font-size:12px;color:${EMAIL_COLORS.textSecondary};border-bottom:1px solid ${EMAIL_COLORS.border};font-weight:600;">${renderInline(cell)}</th>`,
 		)
 		.join('');
 
@@ -49,7 +52,7 @@ function renderTable(lines: string[]): string {
 				`<tr>${row
 					.map(
 						(cell) =>
-							`<td style="padding:6px 12px 6px 0;font-size:14px;color:#1f2328;border-bottom:1px solid #e5e7eb;vertical-align:top;">${renderInline(cell)}</td>`,
+							`<td style="padding:6px 12px 6px 0;font-size:14px;color:${EMAIL_COLORS.textPrimary};border-bottom:1px solid ${EMAIL_COLORS.border};vertical-align:top;">${renderInline(cell)}</td>`,
 					)
 					.join('')}</tr>`,
 		)
@@ -128,5 +131,5 @@ export function renderReplyHtml(text: string): string {
 	}
 	flushParagraph();
 
-	return `<div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:14px;color:#1f2328;">${blocks.join('')}</div>`;
+	return `<div style="font-family:${EMAIL_FONT_STACK};font-size:14px;color:${EMAIL_COLORS.textPrimary};">${blocks.join('')}</div>`;
 }

@@ -19,6 +19,9 @@ import { emailHandler } from './mail/inbound';
 import { resolveArtist } from './core/resolve';
 import { routeMcpRequest } from './mcp/server';
 import { runDailySchedule, shouldRunForCron, type ScheduleEnv } from './core/schedule';
+import { resetSubscriberOnboarding } from './mail/onboard';
+import { CloudflareMailer } from './mail/cloudflare';
+import { getSubscriberByEmail } from './db/queries';
 
 // Same domain S1.3 verified a real send against, and the same default every
 // other file reading DIGEST_FROM_ADDRESS off `env as any` falls back to
@@ -59,6 +62,37 @@ export default {
 					headers: { 'content-type': 'application/json' },
 				});
 			}
+		}
+
+		// Permanent admin utility: resets one subscriber back to a
+		// pre-onboarding state (watchlist/inbox/sent_replies/preferences wiped)
+		// and resends the welcome invite, in one call -- see
+		// `resetSubscriberOnboarding` (src/mail/onboard.ts) for exactly what's
+		// touched. Gated by ADMIN_OPS_TOKEN, a secret distinct from
+		// MCP_AUTH_TOKEN so rotating it never disturbs the scheduled task's MCP
+		// connector (SCHEDULED_TASK.md). Kept wired permanently rather than
+		// added/removed per use -- see PROGRESS.md for why.
+		if (url.pathname === '/admin/reset-onboarding') {
+			const adminEnv = env as any;
+			const token = url.searchParams.get('token');
+			if (!adminEnv.ADMIN_OPS_TOKEN || token !== adminEnv.ADMIN_OPS_TOKEN) {
+				return new Response('unauthorized', { status: 401 });
+			}
+			const subscriberIdParam = url.searchParams.get('subscriber_id');
+			const emailParam = url.searchParams.get('email');
+			let subscriberId = subscriberIdParam ? Number(subscriberIdParam) : null;
+			if (subscriberId === null && emailParam) {
+				const subscriber = await getSubscriberByEmail(adminEnv.DB, emailParam);
+				if (!subscriber) return new Response(JSON.stringify({ error: `no subscriber with email ${emailParam}` }), { status: 404 });
+				subscriberId = subscriber.id;
+			}
+			if (subscriberId === null) {
+				return new Response(JSON.stringify({ error: 'pass ?subscriber_id=<n> or ?email=<address>' }), { status: 400 });
+			}
+			const fromAddress = adminEnv.DIGEST_FROM_ADDRESS ?? DEFAULT_FROM_ADDRESS;
+			const mailer = new CloudflareMailer(adminEnv.EMAIL, { from: fromAddress, isVerifiedRecipient: () => true });
+			const result = await resetSubscriberOnboarding(adminEnv.DB, mailer, subscriberId);
+			return new Response(JSON.stringify(result), { headers: { 'content-type': 'application/json' } });
 		}
 
 		url.pathname = '/__scheduled';
